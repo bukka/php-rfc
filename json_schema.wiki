@@ -1,0 +1,110 @@
+====== PHP RFC: JSON Schema validation support ======
+  * Version: 0.1
+  * Date: 2025-06-01
+  * Author: Jakub Zelenka, bukka@php.net
+  * Status: Draft
+
+
+===== Introduction =====
+
+The json extension does not offer any way of structural validation of the content except basic
+syntax checking. Being able to validate the actual structure is very useful in many ways and
+it has been requested many times.
+
+The [[https://json-schema.org/|JSON Schema]] became a primary method of validation the JSON
+and has been widely adopted. As such PHP would benefit from having that support in JSON extenions.
+
+===== Proposal =====
+
+The proposal is to add support JSON Schema to JSON extension. Specifically, it adds support to
+json_decode and json_validate. This is done as an additional argument that accepts schema object.
+The object can be created from string
+
+==== API ====
+
+The proposal introduces a new class JsonSchema that can be created only using static method
+createFromString. It also introduces a new exception class JsonSchemaException that is a subclass
+of JsonException. The API stub is following:
+
+<code php>
+<?php
+class JsonSchemaException extends JsonException
+{
+}
+
+/** @not-serializable */
+class JsonSchema
+{
+    private final function __construct() {}
+
+    public static function createFromString(string $source): JsonSchema {}
+}
+
+// Addition of $schema paramater
+function json_decode(string $json, ?bool $associative = null, int $depth = 512, int $flags = 0, ?JsonSchema $schema = null): mixed {}
+
+// Addition of $schema paramater
+function json_validate(string $json, int $depth = 512, int $flags = 0, ?JsonSchema $schema = null): bool {}
+?>
+</code>
+
+===== Backward Incompatible Changes =====
+  
+None
+
+===== Proposed PHP Version(s) =====
+
+PHP 8.5
+
+===== RFC Impact =====
+
+==== To SAPIs ====
+No impact
+
+==== To Existing Extensions ====
+
+No impact
+
+==== To Opcache ====
+
+No impact
+
+==== New Constants ====
+
+Various error constants
+
+===== Open Issues =====
+
+None
+
+===== Future Scope =====
+  * Default 
+  * Better error reporting (location of the error)
+
+===== Proposed Voting Choices =====
+
+As per the voting RFC a yes/no vote with a 2/3 majority is needed for this proposal to be accepted.
+
+<doodle title="Should JsonSchema be integrated?" auth="bukka" voteType="single" closed="true">
+   * Yes
+   * No
+</doodle>
+
+The vote started on 2025-07-DD at mm:hh UTC and ends on 2015-07-DD at mm:hh UTC.
+
+===== Patches and Tests =====
+
+Working implementation has been added to jsond and can be seen at
+https://github.com/bukka/php-jsond/tree/next . The jsond is almost the same like json extension
+with some minor changes and different naming. It means that pretty much the same implementation
+can be added to json extension.
+
+===== Implementation =====
+
+After the project is implemented, this section will contain 
+  - the version(s) it was merged to
+  - a link to the git commit(s)
+
+===== References =====
+
+Ths jso library is being developed at https://github.com/bukka/jso
