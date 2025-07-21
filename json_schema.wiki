@@ -1,5 +1,5 @@
 ====== PHP RFC: JSON Schema validation support ======
-  * Version: 0.2
+  * Version: 0.3
   * Date: 2025-06-15
   * Author: Jakub Zelenka, bukka@php.net
   * Status: Under Discussion
@@ -20,6 +20,17 @@ The proposal is to add JSON Schema support to the JSON extension. Specifically, 
 json_decode and json_validate. This is done as an additional argument that accepts a schema object.
 The object can be created from a string. The error handling is consistent with the current handling.
 
+The support for the following drafts is expected:
+
+  * draft-04
+  * draft-06
+  * draft-07
+  * 2019-09
+  * 2020-12
+
+The version will be selected by $schema keyword that is required in the initial implementation.
+There are plans to make this optional in the future and explicitly allow selecting the draft.
+
 ==== API ====
 
 The proposal introduces a new class JsonSchema that can be created only using a static method
@@ -28,6 +39,27 @@ of JsonException. The API stub is as follows:
 
 <code php>
 <?php
+
+class JsonSchemaException extends JsonException
+{
+}
+
+/**
+ * @not-serializable
+ * @strict-properties
+ */
+final class JsonSchema
+{
+    private final function __construct() {}
+
+    public static function createFromString(string $source): JsonSchema {}
+}
+
+// Addition of $schema paramater
+function json_decode(string $json, ?bool $associative = null, int $depth = 512, int $flags = 0, ?JsonSchema $schema = null): mixed {}
+
+// Addition of $schema paramater
+function json_validate(string $json, int $depth = 512, int $flags = 0, ?JsonSchema $schema = null): bool {}
 
 /**
  * @var int
@@ -155,31 +187,14 @@ const JSON_ERROR_SCHEMA_VALUE_DATA_TYPE = UNKNOWN;
  */
 const JSON_ERROR_SCHEMA_VERSION = UNKNOWN;
 
-class JsonSchemaException extends JsonException
-{
-}
-
-/**
- * @not-serializable
- * @strict-properties
- */
-final class JsonSchema
-{
-    private final function __construct() {}
-
-    public static function createFromString(string $source): JsonSchema {}
-}
-
-// Addition of $schema paramater
-function json_decode(string $json, ?bool $associative = null, int $depth = 512, int $flags = 0, ?JsonSchema $schema = null): mixed {}
-
-// Addition of $schema paramater
-function json_validate(string $json, int $depth = 512, int $flags = 0, ?JsonSchema $schema = null): bool {}
 ?>
 </code>
 
 The specified error codes are either used as exception codes or global error codes. This means it
 follows the current error handling in the JSON extension.
+
+Also new messages are provided for the specific schema errors describing the actual errors. This
+is available in the excpetion message and message from json_last_error_msg().
 
 ===== Backward Incompatible Changes =====
   
@@ -187,34 +202,33 @@ None
 
 ===== Proposed PHP Version(s) =====
 
-PHP 8.5
+PHP 8.6
 
 ===== Future Scope =====
 
 The significant effort to develop the whole library for JSON Schema wasn't just to introduce
-verification. The main motivation was about what this might allow, primarily the ability to map
+validation. The main motivation was about what this might allow, primarily the ability to map
 JSON data to specific PHP classes and the ability to do early parsing termination, thus potentially
 eliminating hash DoS attacks. Specifically, the following features might be considered:
 
-  * Support for default draft selection to allow schemas without the $schema tag (technically not compliant with the spec)
-  * Complete support for all drafts
+  * Better error reporting - location of the error (some sort of JSON pointer stringification) and callecting multiple errors
+  * Support for default draft selection to allow schemas without the $schema tag (technically not compliant with the spec but often used anyway)
   * Early validation failure if it is certain that an instance will be invalid (this is actually not that simple due to composition, but it is doable)
   * Special new schema keyword to specify mapping class for objects and subsequent mapping into them (native hydration)
   * New creation functions like createFromArray and possibly createFromClass (possibility to automatically generate schema from class and attributes)
-  * Better error reporting (location of the error)
   * Optional validation of some formats
   * Exposing JSON pointer to user space (e.g., JsonPointer class)
 
 The above list contains more ideas that might be proposed, but each of them will, of course, require
 a separate RFC. There are more things that can be done as well. In addition to the schema-specific
-parts, the plan is to also look into the introduction of a new SIMD parser that would live in jso and
-could be used by the JSON extension. That could result in significant performance gains.
+parts, the plan is to also look into the introduction of a new SIMD parser that would live in jso
+library and could be used by the JSON extension. That could result in significant performance gains.
 
 ===== Proposed Voting Choices =====
 
 As per the voting RFC a yes/no vote with a 2/3 majority is needed for this proposal to be accepted.
 
-<doodle title="Should JsonSchema be integrated to json extension?" auth="bukka" voteType="single" closed="true">
+<doodle title="Should JsonSchema validation be integrated to json extension?" auth="bukka" voteType="single" closed="true">
    * Yes
    * No
 </doodle>
@@ -228,13 +242,13 @@ https://github.com/bukka/php-jsond/tree/next. The jsond extension is almost the 
 extension with some minor changes and different naming. This means that pretty much the same
 implementation can be added to the json extension.
 
-The actual schema integration is done using my jso library that can be found at
+The actual schema integration is done using the jso library that can be found at
 https://github.com/libjso/jso. This is an independent library initially developed for testing the
 json parser before it was migrated to jsond and later became the current implementation of the
 json extension. The development of JSON schema validation started a few years ago and has
 stabilized over time. There is still ongoing development to support more drafts. The current
-status is almost complete draft 4 and 6 support. Draft 7 support is coming soon. Other drafts
-might be available before the PHP RC1 version. The reason the development is separated is the
+status is almost complete draft 4 and 6 support. Draft 7 support is coming soon. Other leter drafts
+will be covered before merging the code. The reason the development is separated is the
 possibility of introducing unit tests and specifically tailored integration tests. It is also
 much easier to debug and verify issues as well as experiment with new features.
 
