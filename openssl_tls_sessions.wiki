@@ -1,0 +1,353 @@
+====== PHP RFC: TLS Session Resumption Support for Streams ======
+  * Version: 0.1
+  * Date: 2025-10-23
+  * Author: Jakub Zelenka, bukka@php.net
+  * Status: Draft
+
+===== Introduction =====
+This RFC proposes adding comprehensive TLS session resumption support to PHP's OpenSSL stream
+implementation. Session resumption is a critical performance optimization that allows TLS clients
+and servers to skip the expensive full handshake by reusing cryptographic parameters from previous
+connections.
+
+Currently, PHP's stream wrapper provides limited control over session management. While OpenSSL's
+internal session cache works automatically for some scenarios, developers cannot:
+
+  * Save and restore client sessions across PHP requests
+  * Implement custom server-side session storage (Redis, Memcached, databases)
+  * Control session cache behavior
+  * Prepare for TLS 1.3 0-RTT early data (future enhancement)
+
+This proposal exposes OpenSSL's session management APIs through the existing stream context
+options, providing fine-grained control while maintaining backward compatibility.
+
+<PHP>
+<?php
+// Client: Resume previous session for faster reconnection
+$context = stream_context_create([
+    'ssl' => [
+        'peer_name' => 'api.example.com',
+        'session_data' => $_SESSION['tls_session'] ?? null,
+        'session_new_cb' => function($stream, $sessionId, $sessionData) {
+            $_SESSION['tls_session'] = $sessionData;
+        }
+    ]
+]);
+
+$fp = stream_socket_client('tls://api.example.com:443', context: $context);
+// Second connection will resume, saving ~100ms of handshake time
+?>
+</PHP>
+
+===== Proposal =====
+
+==== New Stream Context Options ====
+
+This proposal adds the following SSL stream context options:
+
+=== Client and Server Options ===
+
+  * **session_tickets** (bool, default: true) - Enable or disable session ticket support. Maps to SSL_OP_NO_TICKET.
+
+=== Client-Only Options ===
+
+  * **session_data** (string) - Binary session data from a previous connection to resume. Data must be from a session_new_cb callback.
+  * **session_new_cb** (callable) - Callback invoked when a new session is established.
+    * Signature: ''function(resource $stream, string $sessionId, string $sessionData): void''
+    * ''$sessionId'': Binary session identifier
+    * ''$sessionData'': Serialized session (OpenSSL format via i2d_SSL_SESSION)
+
+=== Server-Only Options ===
+
+  * **session_cache** (bool, default: true) - Enable or disable session caching on the server.
+  * **session_cache_size** (int, default: 20480) - Maximum number of sessions in the internal cache. Only applies when using OpenSSL's internal cache.
+  * **session_timeout** (int, default: 300) - Session lifetime in seconds.
+  * **session_new_cb** (callable) - Callback invoked when a new session is created. Same signature as client version.
+  * **session_get_cb** (callable) - Callback to retrieve a session from external storage. Requires session_new_cb.
+    * Signature: ''function(resource $stream, string $sessionId): ?string''
+    * Must return session data or null if not found
+  * **session_remove_cb** (callable, optional) - Callback when a session is removed from cache.
+    * Signature: ''function(resource $stream, string $sessionId): void''
+
+==== Behavior ====
+
+=== Client Behavior ===
+
+When a client stream is created:
+
+  1. If ''session_data'' is provided, attempt to resume with that session
+  2. If ''session_new_cb'' is provided, call it when a new session is established or received
+  3. ''session_tickets'' controls whether to use session tickets
+  4. Server-only options (''session_get_cb'', ''session_remove_cb'', ''session_cache'', etc.) are ignored with a warning
+
+=== Server Behavior ===
+
+When a server stream is created:
+
+**Without External Cache** (no ''session_get_cb''):
+  * Uses OpenSSL's internal session cache
+  * ''session_cache'' controls whether caching is enabled
+  * ''session_cache_size'' and ''session_timeout'' configure the internal cache
+  * ''session_new_cb'' can be provided for notifications without external storage
+
+**With External Cache** (''session_get_cb'' provided):
+  * Disables OpenSSL's internal cache (uses SSL_SESS_CACHE_NO_INTERNAL)
+  * ''session_new_cb'' becomes **required** (E_WARNING if missing)
+  * ''session_remove_cb'' is optional
+  * ''session_cache_size'' and ''session_timeout'' are ignored (application manages storage)
+
+==== Examples ====
+
+=== Client: Simple Session Caching ===
+
+<PHP>
+<?php
+$sessions = [];
+
+function create_client_context(string $host): resource {
+    global $sessions;
+    
+    return stream_context_create([
+        'ssl' => [
+            'peer_name' => $host,
+            'session_data' => $sessions[$host] ?? null,
+            'session_new_cb' => function($stream, $id, $data) use ($host) {
+                global $sessions;
+                $sessions[$host] = $data;
+                error_log("Saved session for $host");
+            }
+        ]
+    ]);
+}
+
+// First connection - full handshake
+$fp1 = stream_socket_client(
+    'tls://api.example.com:443',
+    $errno, $errstr, 30,
+    STREAM_CLIENT_CONNECT,
+    create_client_context('api.example.com')
+);
+
+// Second connection - resumed! (much faster)
+$fp2 = stream_socket_client(
+    'tls://api.example.com:443',
+    $errno, $errstr, 30,
+    STREAM_CLIENT_CONNECT,
+    create_client_context('api.example.com')
+);
+?>
+</PHP>
+
+=== Server: Internal Cache (Default Behavior) ===
+
+<PHP>
+<?php
+$context = stream_context_create([
+    'ssl' => [
+        'local_cert' => '/path/to/cert.pem',
+        'local_pk' => '/path/to/key.pem',
+        // Session resumption enabled by default
+        'session_cache' => true,
+        'session_cache_size' => 1024,
+        'session_timeout' => 7200,  // 2 hours
+    ]
+]);
+
+$server = stream_socket_server(
+    'tls://0.0.0.0:8443',
+    $errno, $errstr,
+    STREAM_SERVER_BIND | STREAM_SERVER_LISTEN,
+    $context
+);
+
+while ($conn = stream_socket_accept($server)) {
+    // Handle connection
+    // Client session resumption happens automatically
+}
+?>
+</PHP>
+
+=== Server: External Cache (Redis) ===
+
+<PHP>
+<?php
+$redis = new Redis();
+$redis->connect('127.0.0.1', 6379);
+
+$context = stream_context_create([
+    'ssl' => [
+        'local_cert' => '/path/to/cert.pem',
+        'local_pk' => '/path/to/key.pem',
+        
+        'session_new_cb' => function($stream, $id, $data) use ($redis) {
+            $key = 'tls_session:' . bin2hex($id);
+            $redis->setex($key, 7200, $data);
+        },
+        
+        'session_get_cb' => function($stream, $id) use ($redis) {
+            $key = 'tls_session:' . bin2hex($id);
+            $result = $redis->get($key);
+            return $result !== false ? $result : null;
+        },
+        
+        'session_remove_cb' => function($stream, $id) use ($redis) {
+            $key = 'tls_session:' . bin2hex($id);
+            $redis->del($key);
+        },
+    ]
+]);
+
+$server = stream_socket_server(
+    'tls://0.0.0.0:8443',
+    $errno, $errstr,
+    STREAM_SERVER_BIND | STREAM_SERVER_LISTEN,
+    $context
+);
+
+// Now sessions are shared across PHP-FPM workers via Redis
+while ($conn = stream_socket_accept($server)) {
+    // Handle connection
+}
+?>
+</PHP>
+
+=== Server: Disable Session Resumption ===
+
+<PHP>
+<?php
+// For high-security scenarios
+$context = stream_context_create([
+    'ssl' => [
+        'local_cert' => '/path/to/cert.pem',
+        'session_cache' => false,  // No session resumption
+    ]
+]);
+
+$server = stream_socket_server('tls://0.0.0.0:8443', context: $context);
+?>
+</PHP>
+
+=== Edge Case: Invalid Session Data ===
+
+<PHP>
+<?php
+// Invalid or expired session data is handled gracefully
+$context = stream_context_create([
+    'ssl' => [
+        'peer_name' => 'example.com',
+        'session_data' => 'corrupted_data',  // Invalid
+    ]
+]);
+
+// E_WARNING emitted, falls back to full handshake
+$fp = stream_socket_client('tls://example.com:443', context: $context);
+?>
+</PHP>
+
+===== Backward Incompatible Changes =====
+
+This RFC introduces **no backward incompatible changes**.
+
+  * All new options are optional and have sensible defaults
+  * Session resumption is already enabled by default in OpenSSL (this RFC just exposes control)
+  * Existing code continues to work without modification
+  * New options are ignored in older PHP versions (standard stream context behavior)
+
+**Potential Considerations:**
+
+  * Applications that rely on every connection being a full handshake (rare) might observe different timing characteristics, but this is already the case with OpenSSL's default behavior
+  * The new callbacks use resources passed as parameters - these must not be stored beyond the callback scope (documented limitation)
+
+**Impact Analysis:**
+
+GitHub searches for the new option names show no conflicts:
+  * ''session_data'' - No existing usage in ssl context
+  * ''session_new_cb'' - No existing usage
+  * ''session_get_cb'' - No existing usage
+  * ''session_cache'' - No existing usage
+
+===== Proposed PHP Version(s) =====
+Next PHP 8.5
+
+===== RFC Impact =====
+
+==== To SAPIs ====
+No impact. The changes are isolated to the OpenSSL stream wrapper implementation in ext openssl.
+
+==== To Existing Extensions ====
+No impact to other extensions. Changes are confined to ext openssl's stream transport implementation.
+
+==== To the Ecosystem ====
+
+**Positive impacts:**
+
+  * **IDEs/Language Servers**: New context options will appear in autocomplete
+  * **Static Analyzers**: Can validate callback signatures and types
+  * **HTTP Clients**: Libraries like Guzzle, Symfony HttpClient can optimize performance with session reuse
+  * **Async Frameworks**: ReactPHP, Amp, Swoole can benefit from persistent session caching across connections
+  * **Microservices**: Service-to-service communication can see significant latency reduction
+
+**Documentation needs:**
+
+  * PHP manual updates for stream context options
+  * Examples showing session resumption patterns
+  * Security considerations (forward secrecy implications)
+
+===== Open Issues =====
+None. All design questions have been resolved.
+
+===== Future Scope =====
+
+This RFC lays the groundwork for future TLS 1.3 enhancements:
+
+  * **0-RTT Early Data**: Building on session resumption to enable zero round-trip time data transmission
+  * **PSK (Pre-Shared Key)**: External PSK support for certificate-free authentication
+  * **Post-Handshake Authentication**: TLS 1.3 client certificate requests after initial handshake
+  * **Ticket Key Rotation**: Callbacks for server-side session ticket key management
+  * **Session Export**: Additional helper functions to inspect session metadata
+
+These features are intentionally excluded from this RFC to maintain focus and allow for iterative development.
+
+===== Proposed Voting Choices =====
+This is a simple yes/no vote requiring a 2/3 majority.
+
+<doodle title="Add TLS session resumption support to streams as described in this RFC?" voteType="single" closed="true">
+   * Yes
+   * No
+</doodle>
+
+===== Patches and Tests =====
+Implementation PR: https://github.com/php/php-src/pull/XXXXX
+
+===== Implementation =====
+After the project is implemented, this section should contain:
+  - the version it was merged into
+  - a link to the git commit(s)  
+  - a link to the PHP manual entry for the feature
+  - a link to the language specification section (if any)
+
+===== References =====
+  * [[https://www.rfc-editor.org/rfc/rfc8446.html#section-2.2|TLS 1.3 Resumption and PSK (RFC 8446)]]
+  * [[https://www.rfc-editor.org/rfc/rfc5246.html#section-7.3|TLS 1.2 Session Resumption (RFC 5246)]]
+  * [[https://www.openssl.org/docs/man3.0/man3/SSL_CTX_sess_set_new_cb.html|OpenSSL Session Callbacks Documentation]]
+  * [[https://www.openssl.org/docs/man3.0/man3/SSL_set_session.html|OpenSSL Session Management API]]
+  * [[https://wiki.php.net/rfc/howto|PHP RFC HowTo]]
+
+===== Rejected Features =====
+
+**SSL_SESS_CACHE_CLIENT and SSL_SESS_CACHE_BOTH constants**: These OpenSSL cache modes don't map to
+PHP's stream architecture where each connection creates a separate SSL_CTX. Client-side resumption
+is handled explicitly via the ''session_data'' option, making cache-mode constants unnecessary.
+Only boolean ''session_cache'' option is provided for servers.
+
+**Automatic client-side caching**: Considered adding a ''session_cache => true'' option for clients
+that would automatically cache by peer_name, but rejected as it adds magic behavior and state
+management concerns across requests. Developers can easily implement this pattern with
+''session_new_cb'' as shown in examples.
+
+**Session metadata in callbacks**: Discussed passing additional information like protocol version,
+cipher suite, and expiry time to callbacks. Rejected to keep the API simple - developers can use
+OpenSSL functions directly if they need to inspect session details.
+
+===== Changelog =====
+  * 2025-10-23: Initial RFC published
