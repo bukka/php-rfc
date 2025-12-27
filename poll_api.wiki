@@ -1,5 +1,5 @@
 ====== PHP RFC: Polling API ======
-  * Version: 1.0
+  * Version: 1.1
   * Date: 2025-10-30
   * Author: Jakub Zelenka, bukka@php.net
   * Status: Under Discussion
@@ -7,23 +7,78 @@
 
 ===== Introduction =====
 
-PHP currently provides only the stream_select() function for I/O multiplexing, which is based on
-the select() system call. This approach has several limitations:
+==== What is I/O Polling? ====
 
-  * Limited scalability - select() has a maximum file descriptor limit (typically 1024)
-  * Poor performance with large numbers of file descriptors
-  * No access to modern, efficient polling mechanisms like epoll (Linux), or kqueue (BSD/macOS)
-  * No support for advanced features like edge-triggered notifications
+I/O polling (also called I/O multiplexing) is a mechanism that allows a program to efficiently monitor multiple I/O
+resources (like network sockets, pipes, or files) simultaneously and be notified when any of them are ready for
+reading, writing, or have encountered an error condition. Instead of checking each resource repeatedly or blocking
+on a single resource, polling lets you wait for events on many resources at once.
 
-Modern applications, particularly those handling many concurrent connections (web servers, message
-queues, WebSocket servers), would benefit significantly from access to platform-specific,
-high-performance polling mechanisms.
+Think of it like a receptionist monitoring multiple phone lines: rather than picking up each phone individually to
+check if someone is calling, the receptionist can see at a glance which lines have incoming calls and handle them
+as needed.
+
+Common polling mechanisms include:
+  * **select()** and **poll()** - Traditional POSIX mechanisms, work everywhere but have performance limitations
+  * **epoll** (Linux) - High-performance, scalable to thousands of connections
+  * **kqueue** (BSD/macOS) - High-performance, generalized event notification
+  * **event ports** (Solaris/illumos) - High-performance kernel event delivery
+  * **WSAPoll** (Windows) - Windows equivalent of poll()
+
+==== Current Situation in PHP ====
+
+PHP currently provides only the stream_select() function for I/O multiplexing, which is based on the select() system
+call. This approach has several limitations:
+
+  * **Limited scalability** - select() has a maximum file descriptor limit in the current implementation (typically 1024 on many systems)
+  * **Poor performance** - O(n) complexity with large numbers of file descriptors
+  * **No access to modern mechanisms** - Cannot use epoll (Linux), kqueue (BSD/macOS), or event ports (Solaris)
+  * **No advanced features** - No support for edge-triggered notifications or one-shot mode
+  * **No internal polling API** - No standardized polling mechanism that PHP core and extensions can share
+
+==== Primary Motivation: Internal API ====
+
+The **primary motivation** for this RFC is to provide a unified internal polling API that PHP core and extensions can
+use. Currently, there are several areas in PHP that would benefit from better polling capabilities:
+
+  * **Signal handling in ZTS** - Safe, efficient signal handling in threaded environments, which is important for FrankenPHP's goroutine-based TSRM mode
+  * **PHP-FPM improvements** - More flexible event handling in FPM workers before accept(), replacing current ad-hoc implementations
+  * **Timer support** - Cross-platform timer implementation, particularly important on macOS where current implementations have issues
+  * **Extension needs** - Extensions like sockets, curl, and others can use a standardized polling interface
+
+By creating this internal API, we establish a foundation that PHP's internals can rely on for efficient I/O operations
+without depending on external libraries like libuv or libevent.
+
+==== Secondary Benefit: Userspace API ====
+
+Once we have a robust internal API, exposing it to userspace provides significant benefits:
+
+  * **stream_select() replacement** - Modern, scalable alternative for stream polling
+  * **Asynchronous framework support** - Projects like AMPHP, ReactPHP, and Revolt can use a single, efficient backend instead of maintaining multiple backend implementations
+  * **High-performance applications** - Users building servers, message queues, or WebSocket servers get access to platform-specific optimizations
+  * **Lower barrier to entry** - No need to install external extensions for basic async I/O
+
+This userspace API is designed to be **minimal and focused** - it provides polling capabilities, not a complete event
+loop. Applications that need full event loop abstractions with timers, signals, and child process management can use
+libraries like AMPHP or ReactPHP, which can then utilize this API as their polling backend.
+
+==== Why Not Bundle libuv or libevent? ====
+
+A common question is why not make ext-uv (libuv) or ext-event (libevent) built-in extensions. There are several reasons:
+
+  * **Dependencies** - Both are external libraries, which cannot be enabled by default unless bundled
+  * **Bloat** - libuv in particular is quite large and includes many features beyond basic polling
+  * **Overhead** - For internal use cases (like signal handling in ZTS), we need minimal overhead
+  * **Control** - Having the implementation in PHP core gives us full control over the API and behavior
+  * **Integration** - A native implementation integrates better with PHP's existing stream infrastructure
+
+The polling API provides exactly what we need - efficient, cross-platform polling - without the complexity of a full event loop library.
 
 ===== Proposal =====
 
-The proposal is to add a new polling API to PHP core that provides a unified interface to
-platform-specific polling mechanisms. This API will automatically select the best available backend
-for the current platform while providing a consistent interface across all systems.
+The proposal is to add a new polling API to PHP core that provides a unified interface to platform-specific polling
+mechanisms. This API will automatically select the best available backend for the current platform while providing
+a consistent interface across all systems.
 
 ==== Supported Backends ====
 
@@ -35,75 +90,192 @@ The implementation will support the following polling backends:
   * **WSAPoll** - Windows
   * **poll** - Fallback for other POSIX systems
 
-The backend will be selected automatically based on platform availability, with an option to
-explicitly choose a specific backend for testing or compatibility purposes.
+The backend will be selected automatically based on platform availability. Users generally should not need to specify
+a backend explicitly - the Auto backend selection will always choose the most appropriate one for the platform.
 
-==== PollHandle Abstraction ====
+==== Handle Abstraction ====
 
-A key innovation in this API is the PollHandle abstraction. This abstract class represents any
-pollable resource and can be extended to support various resource types. The initial implementation
-provides StreamPollHandle for stream resources, but future implementations can add:
+A key innovation in this API is the Handle abstraction. This abstract class represents any pollable resource and can be
+extended to support various resource types. The initial implementation provides StreamPollHandle for stream resources,
+but the design allows for future implementations:
 
+  * **StreamPollHandle** - For stream resources (initial implementation)
   * **SocketPollHandle** - For socket extension resources (future scope)
   * **CurlPollHandle** - For libcurl file descriptors (future scope)
 
-This design allows the polling API to evolve and support additional resource types without breaking
-backward compatibility.
+This design allows the polling API to evolve and support additional resource types without breaking backward compatibility.
 
-==== API ====
+===== API =====
 
-The proposal introduces several new classes and constants:
+The proposal introduces several new classes organized under the ''Io\Poll'' namespace:
+
+==== Context Class ====
 
 <code php>
 <?php
 
-/**
- * Event flag for monitoring readability
- */
-const POLL_EVENT_READ = UNKNOWN;
+namespace Io\Poll;
 
 /**
- * Event flag for monitoring writability
+ * Main polling context for monitoring multiple handles
+ * 
+ * A poll context manages a collection of watchers and provides the main
+ * wait() method to check for events.
  */
-const POLL_EVENT_WRITE = UNKNOWN;
-
-/**
- * Event flag for error conditions (output only)
- */
-const POLL_EVENT_ERROR = UNKNOWN;
-
-/**
- * Event flag for hang up events (output only)
- */
-const POLL_EVENT_HUP = UNKNOWN;
-
-/**
- * Event flag for peer shutdown of write half (epoll only)
- */
-const POLL_EVENT_RDHUP = UNKNOWN;
-
-/**
- * Event flag for one-shot mode
- */
-const POLL_EVENT_ONESHOT = UNKNOWN;
-
-/**
- * Event flag for edge-triggered mode (epoll and kqueue only)
- */
-const POLL_EVENT_ET = UNKNOWN;
-
-/**
- * Enum representing available polling backends
- */
-enum PollBackend : string
+final class Context
 {
-    case Auto = "auto";
-    case Poll = "poll";
-    case Epoll = "epoll";
-    case Kqueue = "kqueue";
-    case EventPorts = "eventport";
-    case WSAPoll = "wsapoll";
+    /**
+     * Create a new poll context
+     * 
+     * @param Backend $backend The polling backend to use (default: Auto)
+     * @throws FailedContextInitializationException If the context cannot be created
+     */
+    public function __construct(Backend $backend = Backend::Auto) {}
+
+    /**
+     * Add a new handle to monitor
+     * 
+     * @param Handle $handle The handle to monitor
+     * @param array $events Array of Event enum cases to watch for
+     * @param mixed $data Optional user data to associate with this watcher
+     * @return Watcher The created watcher instance
+     * @throws FailedHandleAddException If the handle cannot be added
+     * @throws InvalidHandleException If the handle is not valid for polling
+     * @throws HandleAlreadyWatchedException If the handle is already being watched
+     */
+    public function add(Handle $handle, array $events, mixed $data = null): Watcher {}
+
+    /**
+     * Wait for events on monitored handles
+     * 
+     * This method blocks until at least one event occurs or the timeout expires.
+     * 
+     * @param int $timeout Timeout in milliseconds (-1 for infinite, 0 for non-blocking)
+     * @param int $maxEvents Maximum number of events to return (-1 for backend-specific default)
+     * @return array Array of Watcher instances that have triggered events
+     * @throws FailedPollWaitException If the wait operation fails
+     */
+    public function wait(int $timeout = -1, int $maxEvents = -1): array {}
+
+    /**
+     * Get the active polling backend
+     * 
+     * @return Backend The backend being used
+     */
+    public function getBackend(): Backend {}
 }
+</code>
+
+==== Watcher Class ====
+
+<code php>
+<?php
+
+namespace Io\Poll;
+
+/**
+ * Represents a registered watcher in a poll context
+ * 
+ * A watcher monitors a handle for specific events and can be modified or removed.
+ */
+final class Watcher
+{
+    /**
+     * Private constructor preventing direct creation.
+     * 
+     * Watchers are created by Context::add() and cannot be instantiated directly.
+     */
+    private final function __construct() {}
+
+    /**
+     * Get the handle being watched
+     * 
+     * @return Handle The monitored handle
+     */
+    public function getHandle(): Handle {}
+
+    /**
+     * Get the events this watcher is monitoring
+     * 
+     * @return array Array of Event enum cases
+     */
+    public function getWatchedEvents(): array {}
+
+    /**
+     * Get the events that were triggered in the last poll operation
+     * 
+     * @return array Array of Event enum cases
+     */
+    public function getTriggeredEvents(): array {}
+
+    /**
+     * Get the user data associated with this watcher
+     * 
+     * @return mixed The user data
+     */
+    public function getData(): mixed {}
+
+    /**
+     * Check if a specific event was triggered
+     * 
+     * @param Event $event The event to check
+     * @return bool True if the event was triggered
+     */
+    public function hasTriggered(Event $event): bool {}
+
+    /**
+     * Check if this watcher is still active in the poll context
+     * 
+     * @return bool True if active, false if removed
+     */
+    public function isActive(): bool {}
+
+    /**
+     * Modify both the watched events and associated data
+     * 
+     * @param array $events New array of Event enum cases
+     * @param mixed $data New user data
+     * @throws FailedWatcherModificationException If modification fails
+     * @throws InactiveWatcherException If the watcher is not active
+     * @throws InvalidHandleException If the handle is no longer valid
+     */
+    public function modify(array $events, mixed $data = null): void {}
+
+    /**
+     * Modify only the watched events
+     * 
+     * @param array $events New array of Event enum cases
+     * @throws FailedWatcherModificationException If modification fails
+     * @throws InactiveWatcherException If the watcher is not active
+     * @throws InvalidHandleException If the handle is no longer valid
+     */
+    public function modifyEvents(array $events): void {}
+
+    /**
+     * Modify only the associated user data
+     * 
+     * @param mixed $data New user data
+     * @throws InactiveWatcherException If the watcher is not active
+     */
+    public function modifyData(mixed $data): void {}
+
+    /**
+     * Remove this watcher from the poll context
+     * 
+     * After removal, the watcher becomes inactive and cannot be reused.
+     * 
+     * @throws InactiveWatcherException If the watcher is not active
+     */
+    public function remove(): void {}
+}
+</code>
+
+==== Handle Classes ====
+
+<code php>
+<?php
+
+namespace Io\Poll;
 
 /**
  * Abstract base class for pollable handles
@@ -111,7 +283,7 @@ enum PollBackend : string
  * This class represents any resource that can be monitored by the polling API.
  * Concrete implementations provide specific resource types like streams, sockets, etc.
  */
-abstract class PollHandle
+abstract class Handle
 {
     /**
      * Get the underlying file descriptor
@@ -120,19 +292,23 @@ abstract class PollHandle
      */
     protected function getFileDescriptor(): int {}
 }
+</code>
+
+<code php>
+<?php
 
 /**
  * Poll handle for stream resources
  * 
  * Wraps a PHP stream resource to make it compatible with the polling API.
  */
-final class StreamPollHandle extends PollHandle
+final class StreamPollHandle extends \Io\Poll\Handle
 {
     /**
      * Create a new stream poll handle
      * 
      * @param resource $stream A valid PHP stream resource
-     * @throws PollException If the stream is not valid
+     * @throws \Io\Poll\InvalidHandleException If the stream is not valid
      */
     public function __construct($stream) {}
 
@@ -146,192 +322,220 @@ final class StreamPollHandle extends PollHandle
     /**
      * Check if the handle is still valid
      * 
-     * @return bool True if the stream is still valid, false otherwise
+     * @return bool True if the stream is still valid and not EOF, false otherwise
      */
     public function isValid(): bool {}
 }
+</code>
+
+==== Backend Enum ====
+
+<code php>
+<?php
+
+namespace Io\Poll;
 
 /**
- * Represents a registered watcher in a poll context
- * 
- * A watcher monitors a handle for specific events and can be modified or removed.
+ * Enum representing available polling backends
  */
-final class PollWatcher
+enum Backend
 {
-    /**
-     * Private constructor preventing direct creation.
-     * 
-     * Watchers are created by PollContext::add() and cannot be instantiated directly.
-     */
-    private final function __construct() {}
+    case Auto;
+    case Poll;
+    case Epoll;
+    case Kqueue;
+    case EventPorts;
+    case WSAPoll;
 
     /**
-     * Get the handle being watched
+     * Get list of all available backends on this platform
      * 
-     * @return PollHandle The monitored handle
+     * @return array Array of Backend enum cases
      */
-    public function getHandle(): PollHandle {}
+    public static function getAvailableBackends(): array {}
 
     /**
-     * Get the events this watcher is monitoring
+     * Check if this backend is available on the current platform
      * 
-     * @return int Bitmask of POLL_EVENT_* constants
+     * @return bool True if available, false otherwise
      */
-    public function getWatchedEvents(): int {}
+    public function isAvailable(): bool {}
 
     /**
-     * Get the events that were triggered in the last poll operation
+     * Check if this backend supports edge-triggered mode
      * 
-     * @return int Bitmask of POLL_EVENT_* constants
+     * @return bool True if edge-triggered mode is supported
      */
-    public function getTriggeredEvents(): int {}
-
-    /**
-     * Get the user data associated with this watcher
-     * 
-     * @return mixed The user data
-     */
-    public function getData(): mixed {}
-
-    /**
-     * Check if specific events were triggered
-     * 
-     * @param int $events Bitmask of POLL_EVENT_* constants to check
-     * @return bool True if any of the specified events were triggered
-     */
-    public function hasTriggered(int $events): bool {}
-
-    /**
-     * Check if this watcher is still active in the poll context
-     * 
-     * @return bool True if active, false if removed
-     */
-    public function isActive(): bool {}
-
-    /**
-     * Modify both the watched events and associated data
-     * 
-     * @param int $events New bitmask of POLL_EVENT_* constants
-     * @param mixed $data New user data
-     * @throws PollException If modification fails
-     */
-    public function modify(int $events, mixed $data = null): void {}
-
-    /**
-     * Modify only the watched events
-     * 
-     * @param int $events New bitmask of POLL_EVENT_* constants
-     * @throws PollException If modification fails
-     */
-    public function modifyEvents(int $events): void {}
-
-    /**
-     * Modify only the associated user data
-     * 
-     * @param mixed $data New user data
-     */
-    public function modifyData(mixed $data): void {}
-
-    /**
-     * Remove this watcher from the poll context
-     * 
-     * After removal, the watcher becomes inactive and cannot be reused.
-     */
-    public function remove(): void {}
+    public function supportsEdgeTriggering(): bool {}
 }
+</code>
+
+==== Event Enum ====
+
+<code php>
+<?php
+
+namespace Io\Poll;
 
 /**
- * Main polling context for monitoring multiple handles
- * 
- * A poll context manages a collection of watchers and provides the main
- * wait() method to check for events.
+ * Enum representing poll events
  */
-final class PollContext
+enum Event
 {
     /**
-     * Create a new poll context
-     * 
-     * @param PollBackend $backend The polling backend to use (default: Auto)
-     * @throws PollException If the specified backend is not available
+     * Monitor for readability - the file descriptor has data available to read
      */
-    public function __construct(PollBackend $backend = PollBackend::Auto) {}
+    case Read;
 
     /**
-     * Add a new handle to monitor
-     * 
-     * @param PollHandle $handle The handle to monitor
-     * @param int $events Bitmask of POLL_EVENT_* constants to watch for
-     * @param mixed $data Optional user data to associate with this watcher
-     * @return PollWatcher The created watcher instance
-     * @throws PollException If the handle cannot be added
+     * Monitor for writability - the file descriptor is ready to accept data
      */
-    public function add(PollHandle $handle, int $events, mixed $data = null): PollWatcher {}
+    case Write;
 
     /**
-     * Wait for events on monitored handles
-     * 
-     * This method blocks until at least one event occurs or the timeout expires.
-     * 
-     * @param int $timeout Timeout in milliseconds (-1 for infinite, 0 for non-blocking)
-     * @param int $maxEvents Maximum number of events to return (-1 for unlimited)
-     * @return array Array of PollWatcher instances that have triggered events
-     * @throws PollException If the wait operation fails
+     * Error condition occurred on the file descriptor (output only, automatically monitored)
      */
-    public function wait(int $timeout = -1, int $maxEvents = -1): array {}
+    case Error;
 
     /**
-     * Get the active polling backend
-     * 
-     * @return PollBackend The backend being used
+     * Hang up occurred - connection closed by peer (output only, automatically monitored)
      */
-    public function getBackend(): PollBackend {}
+    case HangUp;
+
+    /**
+     * Peer closed connection or shut down writing half (Linux epoll only, must be explicitly requested)
+     */
+    case ReadHangUp;
+
+    /**
+     * One-shot mode - automatically remove the watcher after it triggers once
+     */
+    case OneShot;
+
+    /**
+     * Edge-triggered mode - only report state changes rather than state (epoll and kqueue only)
+     */
+    case EdgeTriggered;
 }
+</code>
+
+==== Exception Hierarchy ====
+
+<code php>
+<?php
+
+namespace Io;
+
+/**
+ * Base exception for I/O operations
+ */
+class IoException extends \Exception {}
+</code>
+
+<code php>
+<?php
+
+namespace Io\Poll;
 
 /**
  * Exception thrown by polling operations
  */
-class PollException extends Exception
+class PollException extends \Io\IoException {}
+
+/**
+ * Abstract base class for exceptions that include error codes
+ */
+abstract class FailedPollOperationException extends PollException
 {
+    const int ERROR_NONE = 0;        // No error
+    const int ERROR_SYSTEM = 1;      // Generic system error
+    const int ERROR_NOMEM = 2;       // Out of memory (ENOMEM)
+    const int ERROR_INVALID = 3;     // Invalid argument (EINVAL, EBADF)
+    const int ERROR_EXISTS = 4;      // Already exists (EEXIST)
+    const int ERROR_NOTFOUND = 5;    // Not found (ENOENT)
+    const int ERROR_TIMEOUT = 6;     // Operation timed out
+    const int ERROR_INTERRUPTED = 7; // Interrupted by signal (EINTR)
+    const int ERROR_PERMISSION = 8;  // Permission denied
+    const int ERROR_TOOBIG = 9;      // Too many resources
+    const int ERROR_AGAIN = 10;      // Try again (EAGAIN)
+    const int ERROR_NOSUPPORT = 11;  // Not supported
 }
 
-?>
+/**
+ * Failed to initialize polling context
+ */
+class FailedContextInitializationException extends FailedPollOperationException {}
+
+/**
+ * Failed to add handle to context
+ */
+class FailedHandleAddException extends FailedPollOperationException {}
+
+/**
+ * Failed to modify watcher
+ */
+class FailedWatcherModificationException extends FailedPollOperationException {}
+
+/**
+ * Failed during poll wait operation
+ */
+class FailedPollWaitException extends FailedPollOperationException {}
+
+/**
+ * Operation attempted on inactive watcher
+ */
+class InactiveWatcherException extends PollException {}
+
+/**
+ * Handle is already being watched
+ */
+class HandleAlreadyWatchedException extends PollException {}
+
+/**
+ * Handle is not valid for polling
+ */
+class InvalidHandleException extends PollException {}
 </code>
 
-==== Event Constants ====
+==== Event Enum Cases ====
 
-Event constants can be combined using bitwise OR operator (|).
+Event enum cases can be combined in arrays passed to ''Context::add()'' and ''Watcher::modify()'' methods.
 
 === Input Events ===
 
 These events can be specified when adding or modifying watchers to indicate which conditions to monitor:
 
-  * **POLL_EVENT_READ** - Monitor for readability - the file descriptor has data available to read
-  * **POLL_EVENT_WRITE** - Monitor for writability - the file descriptor is ready to accept data
-  * **POLL_EVENT_RDHUP** - Monitor for peer shutdown of write half of connection (Linux epoll only, must be explicitly requested)
-  * **POLL_EVENT_ONESHOT** - One-shot mode - automatically remove the watcher after it triggers once
-  * **POLL_EVENT_ET** - Edge-triggered mode - only report state changes rather than state (epoll and kqueue only)
+  * **Event::Read** - Monitor for readability - the file descriptor has data available to read
+  * **Event::Write** - Monitor for writability - the file descriptor is ready to accept data
+  * **Event::ReadHangUp** - Monitor for peer shutdown of write half of connection (Linux epoll only, must be explicitly requested)
+  * **Event::OneShot** - One-shot mode - automatically remove the watcher after it triggers once
+  * **Event::EdgeTriggered** - Edge-triggered mode - only report state changes rather than state (epoll and kqueue only)
 
 === Output Events ===
 
 These events are returned by the polling backend to indicate conditions that occurred:
 
-  * **POLL_EVENT_READ** - The file descriptor is ready for reading
-  * **POLL_EVENT_WRITE** - The file descriptor is ready for writing
-  * **POLL_EVENT_ERROR** - An error condition occurred on the file descriptor (automatically monitored)
-  * **POLL_EVENT_HUP** - Hang up occurred - connection closed by peer (automatically monitored)
-  * **POLL_EVENT_RDHUP** - Peer closed connection or shut down writing half of connection (Linux epoll only)
+  * **Event::Read** - The file descriptor is ready for reading
+  * **Event::Write** - The file descriptor is ready for writing
+  * **Event::Error** - An error condition occurred on the file descriptor (automatically monitored)
+  * **Event::HangUp** - Hang up occurred - connection closed by peer (automatically monitored)
+  * **Event::ReadHangUp** - Peer closed connection or shut down writing half of connection (Linux epoll only)
 
-Note that POLL_EVENT_READ, POLL_EVENT_WRITE, and POLL_EVENT_RDHUP can appear in both input (to request monitoring) and output (when conditions occur). POLL_EVENT_ERROR and POLL_EVENT_HUP are automatically monitored by all backends and only appear in output events.
+Note that ''Event::Read'', ''Event::Write'', and ''Event::ReadHangUp'' can appear in both input (to request monitoring)
+and output (when conditions occur). ''Event::Error'' and ''Event::HangUp'' are automatically monitored by all backends
+and only appear in output events.
 
-==== Usage Examples ====
+===== Usage Examples =====
 
-=== TCP Server Example ===
+==== Basic TCP Server ====
 
 <code php>
 <?php
 
+use Io\Poll\{Context, Event};
+
 // Create a poll context with automatic backend selection
-$poll = new PollContext();
+$poll = new Context();
 
 // Create a server socket
 $server = stream_socket_server('tcp://0.0.0.0:8080', $errno, $errstr);
@@ -344,65 +548,67 @@ stream_set_blocking($server, false);
 $serverHandle = new StreamPollHandle($server);
 
 // Add the server socket to the poll context
-$poll->add($serverHandle, POLL_EVENT_READ, ['type' => 'server']);
-
-$clients = [];
+$poll->add($serverHandle, [Event::Read], ['type' => 'server']);
 
 echo "Server listening on port 8080\n";
 
 while (true) {
     // Wait for events (timeout in milliseconds, -1 = infinite)
-    $events = $poll->wait(1000);
+    // Returns array of Watcher instances that have events
+    $watchers = $poll->wait(1000);
     
-    foreach ($events as $watcher) {
+    foreach ($watchers as $watcher) {
         $data = $watcher->getData();
         
-        if ($data['type'] === 'server' && $watcher->hasTriggered(POLL_EVENT_READ)) {
+        if ($data['type'] === 'server' && $watcher->hasTriggered(Event::Read)) {
             // Accept new client connection
             $handle = $watcher->getHandle();
-            $server = $handle->getStream();
-            $client = stream_socket_accept($server, 0);
-            if ($client) {
-                stream_set_blocking($client, false);
-                $clientHandle = new StreamPollHandle($client);
-                $clientWatcher = $poll->add($clientHandle, POLL_EVENT_READ, ['type' => 'client']);
-                $clients[] = $clientWatcher;
-                echo "New client connected\n";
+            if ($handle instanceof StreamPollHandle) {
+                $server = $handle->getStream();
+                $client = stream_socket_accept($server, 0);
+                if ($client) {
+                    stream_set_blocking($client, false);
+                    $clientHandle = new StreamPollHandle($client);
+                    $poll->add($clientHandle, [Event::Read], ['type' => 'client']);
+                    echo "New client connected\n";
+                }
             }
         } elseif ($data['type'] === 'client') {
             $handle = $watcher->getHandle();
-            $stream = $handle->getStream();
-            
-            if ($watcher->hasTriggered(POLL_EVENT_READ)) {
-                // Read data from client
-                $buffer = fread($stream, 8192);
-                if ($buffer === false || $buffer === '') {
-                    echo "Client disconnected\n";
+            if ($handle instanceof StreamPollHandle) {
+                $stream = $handle->getStream();
+                
+                if ($watcher->hasTriggered(Event::Read)) {
+                    // Read data from client
+                    $buffer = fread($stream, 8192);
+                    if ($buffer === false || $buffer === '') {
+                        echo "Client disconnected\n";
+                        $watcher->remove();
+                        fclose($stream);
+                    } else {
+                        echo "Received: $buffer";
+                        // Echo back to client
+                        fwrite($stream, "Echo: $buffer");
+                    }
+                }
+                
+                if ($watcher->hasTriggered(Event::HangUp) || $watcher->hasTriggered(Event::Error)) {
+                    echo "Client connection error or hangup\n";
                     $watcher->remove();
                     fclose($stream);
-                } else {
-                    echo "Received: $buffer";
-                    // Echo back to client
-                    fwrite($stream, "Echo: $buffer");
                 }
-            }
-            
-            if ($watcher->hasTriggered(POLL_EVENT_HUP | POLL_EVENT_ERROR)) {
-                echo "Client connection error or hangup\n";
-                $watcher->remove();
-                fclose($stream);
             }
         }
     }
 }
-
-?>
 </code>
 
-=== TCP Client Example ===
+==== TCP Client ====
 
 <code php>
 <?php
+
+use Io\Poll\{Context, Event};
 
 function sendAndReceive($poll, $watcher, $client, $message, $timeout = 5000) {
     // Send message to server
@@ -410,15 +616,15 @@ function sendAndReceive($poll, $watcher, $client, $message, $timeout = 5000) {
     echo "Sent: $message";
     
     // Wait for response
-    $events = $poll->wait($timeout);
+    $watchers = $poll->wait($timeout);
     
-    if (empty($events)) {
+    if (empty($watchers)) {
         echo "Timeout waiting for response\n";
         return false;
     }
     
-    foreach ($events as $watcher) {
-        if ($watcher->hasTriggered(POLL_EVENT_READ)) {
+    foreach ($watchers as $watcher) {
+        if ($watcher->hasTriggered(Event::Read)) {
             $data = fread($client, 8192);
             if ($data === false || $data === '') {
                 echo "Server closed connection\n";
@@ -428,7 +634,7 @@ function sendAndReceive($poll, $watcher, $client, $message, $timeout = 5000) {
             return true;
         }
         
-        if ($watcher->hasTriggered(POLL_EVENT_ERROR | POLL_EVENT_HUP)) {
+        if ($watcher->hasTriggered(Event::Error) || $watcher->hasTriggered(Event::HangUp)) {
             echo "Connection error\n";
             return false;
         }
@@ -438,7 +644,7 @@ function sendAndReceive($poll, $watcher, $client, $message, $timeout = 5000) {
 }
 
 // Create a poll context
-$poll = new PollContext();
+$poll = new Context();
 
 // Connect to the echo server
 $client = stream_socket_client('tcp://127.0.0.1:8080', $errno, $errstr, 30);
@@ -449,7 +655,7 @@ stream_set_blocking($client, false);
 
 // Create handle and watch for readable data
 $handle = new StreamPollHandle($client);
-$watcher = $poll->add($handle, POLL_EVENT_READ);
+$watcher = $poll->add($handle, [Event::Read]);
 
 // Send messages to the server
 $messages = ["Hello, Server!\n", "How are you?\n", "Goodbye!\n"];
@@ -464,36 +670,36 @@ foreach ($messages as $message) {
 
 fclose($client);
 echo "Client finished\n";
-
-?>
 </code>
 
-=== Callback-based Event Handler ===
+==== Callback-based Event Handler ====
 
 <code php>
 <?php
+
+use Io\Poll\{Context, Event};
 
 /**
  * Generic event-driven wrapper that dispatches to callbacks
  */
 class EventLoop
 {
-    private PollContext $poll;
+    private Context $poll;
     
     public function __construct()
     {
-        $this->poll = new PollContext();
+        $this->poll = new Context();
     }
     
     /**
      * Add a stream with callback handlers
      * 
      * @param resource $stream The stream to monitor
-     * @param int $events Events to watch for
+     * @param array $events Array of Event enums to watch for
      * @param callable $callback Callback to invoke when events occur
-     * @return PollWatcher The created watcher
+     * @return \Io\Poll\Watcher The created watcher
      */
-    public function addStream($stream, int $events, callable $callback): PollWatcher
+    public function addStream($stream, array $events, callable $callback): \Io\Poll\Watcher
     {
         $handle = new StreamPollHandle($stream);
         return $this->poll->add($handle, $events, ['callback' => $callback]);
@@ -505,27 +711,35 @@ class EventLoop
     public function run(): void
     {
         while (true) {
-            $events = $this->poll->wait();
+            $watchers = $this->poll->wait();
             
-            foreach ($events as $watcher) {
+            foreach ($watchers as $watcher) {
                 $data = $watcher->getData();
                 $callback = $data['callback'];
                 
                 // Get stream from the handle
                 $handle = $watcher->getHandle();
-                $stream = $handle->getStream();
-                
-                // Invoke the callback with the watcher and stream
-                $callback($watcher, $stream);
+                if ($handle instanceof \StreamPollHandle) {
+                    $stream = $handle->getStream();
+                    
+                    // Invoke the callback with the watcher and stream
+                    $callback($watcher, $stream);
+                }
             }
         }
     }
     
-    public function getContext(): PollContext
+    public function getContext(): Context
     {
         return $this->poll;
     }
 }
+</code>
+
+<code php>
+<?php
+
+use Io\Poll\Event;
 
 // Usage example - Simple echo server using callbacks
 $loop = new EventLoop();
@@ -533,7 +747,7 @@ $loop = new EventLoop();
 $server = stream_socket_server('tcp://127.0.0.1:9090');
 stream_set_blocking($server, false);
 
-$loop->addStream($server, POLL_EVENT_READ, function($watcher, $stream) use ($loop) {
+$loop->addStream($server, [Event::Read], function($watcher, $stream) use ($loop) {
     // Accept new client
     $client = stream_socket_accept($stream, 0);
     if ($client) {
@@ -541,7 +755,7 @@ $loop->addStream($server, POLL_EVENT_READ, function($watcher, $stream) use ($loo
         echo "Client connected\n";
         
         // Add client with its own callback
-        $loop->addStream($client, POLL_EVENT_READ, function($watcher, $stream) {
+        $loop->addStream($client, [Event::Read], function($watcher, $stream) {
             $data = fread($stream, 8192);
             if ($data === false || $data === '') {
                 echo "Client disconnected\n";
@@ -560,57 +774,64 @@ $loop->addStream($server, POLL_EVENT_READ, function($watcher, $stream) use ($loo
 
 echo "Callback-based server listening on port 9090\n";
 $loop->run();
-
-?>
 </code>
 
-=== Modifying Watchers ===
+==== Modifying Watchers ====
 
 <code php>
 <?php
 
-$poll = new PollContext();
+use Io\Poll\{Context, Event};
+
+$poll = new Context();
 $stream = fopen('php://temp', 'r+');
 $handle = new StreamPollHandle($stream);
 
 // Initially watch for read events
-$watcher = $poll->add($handle, POLL_EVENT_READ, 'some data');
+$watcher = $poll->add($handle, [Event::Read], 'some data');
 
 // Later, modify to watch for write events instead
-$watcher->modifyEvents(POLL_EVENT_WRITE);
+$watcher->modifyEvents([Event::Write]);
 
 // Or modify both events and data
-$watcher->modify(POLL_EVENT_READ | POLL_EVENT_WRITE, 'updated data');
+$watcher->modify([Event::Read, Event::Write], 'updated data');
 
 // Just modify the associated data
 $watcher->modifyData('new data');
 
 // Remove the watcher when done
 $watcher->remove();
-
-?>
 </code>
 
-=== Edge-Triggered Mode ===
+==== Edge-Triggered Mode ====
 
 <code php>
 <?php
 
-$poll = new PollContext();
+use Io\Poll\{Context, Event, Backend};
+
+$poll = new Context();
+
+// Check if the backend supports edge triggering
+$backend = $poll->getBackend();
+if (!$backend->supportsEdgeTriggering()) {
+    die("Edge-triggered mode not supported on this platform\n");
+}
+
 $stream = stream_socket_client('tcp://example.com:80');
 stream_set_blocking($stream, false);
 
 $handle = new StreamPollHandle($stream);
 
-// Use edge-triggered mode (requires epoll or kqueue backend)
+// Use edge-triggered mode
 // In ET mode, you must read/write until EAGAIN to avoid missing events
-$watcher = $poll->add($handle, POLL_EVENT_READ | POLL_EVENT_ET);
+$watcher = $poll->add($handle, [Event::Read, Event::EdgeTriggered]);
 
 while (true) {
-    $events = $poll->wait();
+    $watchers = $poll->wait();
     
-    foreach ($events as $watcher) {
-        if ($watcher->hasTriggered(POLL_EVENT_READ)) {
+    foreach ($watchers as $watcher) {
+        if ($watcher->hasTriggered(Event::Read)) {
             // In ET mode, read until EAGAIN
             while (($data = fread($stream, 8192)) !== false && $data !== '') {
                 process_data($data);
@@ -618,51 +839,97 @@ while (true) {
         }
     }
 }
-
-?>
 </code>
 
-=== Explicit Backend Selection ===
+==== Backend Information ====
 
 <code php>
 <?php
 
-// Use specific backend (useful for testing or compatibility)
-try {
-    $poll = new PollContext(PollBackend::Poll);
-    echo "Using poll backend\n";
-} catch (PollException $e) {
-    echo "Poll backend not available: " . $e->getMessage() . "\n";
-    exit(1);
+use Io\Poll\{Context, Backend};
+
+// Check available backends
+$available = Backend::getAvailableBackends();
+echo "Available backends:\n";
+foreach ($available as $backend) {
+    echo "  - {$backend->name}";
+    if ($backend->supportsEdgeTriggering()) {
+        echo " (supports edge-triggering)";
+    }
+    echo "\n";
 }
 
-// Check which backend is actually being used
-echo "Active backend: " . $poll->getBackend()->value . "\n";
+// Use automatic backend selection (recommended)
+$poll = new Context();
+echo "Selected backend: {$poll->getBackend()->name}\n";
 
-?>
+// Explicit backend selection (mainly for testing)
+// This will throw an exception if the backend is not available
+try {
+    $poll = new Context(Backend::Epoll);
+    echo "Using epoll backend\n";
+} catch (\Io\Poll\FailedContextInitializationException $e) {
+    echo "Epoll backend not available: " . $e->getMessage() . "\n";
+}
 </code>
 
-==== Internal API ====
+===== Internal API =====
 
-In addition to the userspace API, this RFC introduces a new internal polling API that will be
-available to PHP core and extensions. This internal API provides:
+In addition to the userspace API, this RFC introduces a new internal polling API available to PHP core and extensions through the ''php_poll.h'' header.
 
-  * **Unified polling interface** - Extensions can use a single API regardless of platform
-  * **Extension handle support** - Extensions can register custom handle types through php_poll_handle_ops
-  * **Direct file descriptor access** - Low-level access for extensions that need it
+==== Key Features ====
 
-The internal API is designed to eventually replace the various ad-hoc polling implementations
-currently scattered throughout the codebase. The API is exposed through the php_poll.h header
-and provides the following key functions:
+  * **Unified polling interface** - Single API regardless of platform
+  * **Extension handle support** - Extensions can register custom handle types through ''php_poll_handle_ops''
+  * **Direct file descriptor access** - Low-level access when needed
+  * **Consistent error handling** - Unified error codes across all backends
 
-  * **php_poll_create()** - Create a new poll context with specified backend
-  * **php_poll_add()** - Add a file descriptor to monitor
-  * **php_poll_modify()** - Modify watched events for a file descriptor
-  * **php_poll_remove()** - Remove a file descriptor from monitoring
-  * **php_poll_wait()** - Wait for events with timeout
+==== Core Functions ====
 
-Extensions can also provide custom handle types by implementing the php_poll_handle_ops structure,
-which allows them to define how their resources map to file descriptors and how validity is checked.
+<code c>
+/* Create a new poll context with specified backend */
+php_poll_ctx *php_poll_create(php_poll_backend_type backend, uint32_t flags);
+
+/* Initialize the context (must be called before use) */
+zend_result php_poll_init(php_poll_ctx *ctx);
+
+/* Add a file descriptor to monitor */
+zend_result php_poll_add(php_poll_ctx *ctx, int fd, uint32_t events, void *data);
+
+/* Modify watched events for a file descriptor */
+zend_result php_poll_modify(php_poll_ctx *ctx, int fd, uint32_t events, void *data);
+
+/* Remove a file descriptor from monitoring */
+zend_result php_poll_remove(php_poll_ctx *ctx, int fd);
+
+/* Wait for events with timeout */
+int php_poll_wait(php_poll_ctx *ctx, php_poll_event *events, int max_events, int timeout);
+
+/* Destroy the context and free resources */
+void php_poll_destroy(php_poll_ctx *ctx);
+
+/* Get error information */
+php_poll_error php_poll_get_error(php_poll_ctx *ctx);
+</code>
+
+==== Custom Handle Types ====
+
+Extensions can provide custom handle types by implementing the ''php_poll_handle_ops'' structure:
+
+<code c>
+struct php_poll_handle_ops {
+    /* Get file descriptor for this handle */
+    php_socket_t (*get_fd)(php_poll_handle_object *handle);
+    
+    /* Check if handle is still valid */
+    int (*is_valid)(php_poll_handle_object *handle);
+    
+    /* Cleanup handle-specific data */
+    void (*cleanup)(php_poll_handle_object *handle);
+};
+</code>
+
+This allows extensions to integrate their resources seamlessly with the polling API.
 
 ===== Backward Incompatible Changes =====
   
@@ -682,6 +949,7 @@ This proposal lays the groundwork for several future enhancements:
   * **SignalHandle** - Signal notification support (SIGUSR1, SIGTERM, etc.)
   * **ZTS signal handling improvements** - Use the internal API to properly handle signals in threaded environments
   * **FPM event loop optimization** - Migrate PHP-FPM to use the internal polling API for improved performance
+  * **Internal polling consolidation** - Replace various ad-hoc polling implementations throughout the codebase
 
 ===== Performance Considerations =====
 
@@ -692,9 +960,8 @@ The polling API provides significant performance benefits over stream_select():
   * **Reduced system calls** - Persistent event registration vs. per-call registration in select()
   * **Edge-triggered mode** - Further reduces system calls by notifying only on state changes
 
-Modern polling mechanisms like epoll and kqueue are specifically designed for high-performance
-applications and can scale to tens of thousands of concurrent connections where select() becomes
-impractical.
+Benchmarks show that epoll and kqueue maintain consistent performance with 10,000+ concurrent connections, whereas
+select() degrades significantly beyond a few hundred connections.
 
 ===== Proposed Voting Choices =====
 
@@ -709,11 +976,10 @@ The vote started on 2025-XX-XX at XX:XX UTC and ends on 2025-XX-XX at XX:XX UTC.
 
 ===== Patches and Tests =====
 
-A working implementation is under development and will be available at [repository URL].
+A working implementation is under development and will be available at https://github.com/php/php-src/pull/19572.
 
-The implementation includes a complete test suite covering all backends and common use cases.
-The tests are designed to run on all supported platforms and automatically skip backend-specific
-tests when the backend is not available.
+The implementation includes a complete test suite covering all backends and common use cases. The tests are designed
+to run on all supported platforms and automatically skip backend-specific tests when the backend is not available.
 
 ===== Implementation =====
 
@@ -730,5 +996,5 @@ After the project is implemented, this section will contain:
 
 ===== Changelog =====
 
+  * 1.1 - Updated with better motivation explanation, polling overview, target audience clarification, fixed examples
   * 1.0 - Initial version
-  
