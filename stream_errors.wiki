@@ -1,12 +1,12 @@
 ====== PHP RFC: Stream Error Handling Improvements ======
-  * Version: 1.0
+  * Version: 2.0
   * Date: 2025-11-18
   * Author: Jakub Zelenka, bukka@php.net
   * Status: Under Discussion
 
 ===== Introduction =====
 
-PHP's stream error handling has historically been inconsistent across different stream wrappers and operations. Errorr
+PHP's stream error handling has historically been inconsistent across different stream wrappers and operations. Errors
 are reported through various mechanisms - some use warnings, others use notices, and the error messages often lack
 structure or context. This makes it difficult to:
 
@@ -20,13 +20,14 @@ This RFC proposes a unified error handling system for PHP streams that provides:
   * **Consistent error reporting** across all stream wrappers
   * **Multiple error modes** - traditional warnings, exceptions, or silent mode
   * **Structured error storage** - retrieve detailed error information programmatically
-  * **Custom error handlers** - error callback support
-  * **Semantic error codes** - well-defined codes for different error conditions
+  * **Custom error handlers** - error callback support with structured error objects
+  * **Semantic error codes** - well-defined enum-based codes for different error conditions
+  * **Error chaining** - track multiple related errors in a single operation
 
 ===== Proposal =====
 
-This proposal introduces a comprehensive error handling system for PHP streams through new context options, a dedicated
-exception class, error codes, and a function to retrieve stored errors.
+This proposal introduces a comprehensive error handling system for PHP streams through new context options, enums,
+classes, and functions for retrieving stored errors.
 
 ==== Stream Error Context Options ====
 
@@ -34,81 +35,347 @@ Three new context options are added under the root `stream` field to control err
 
 === error_mode ===
 
-Controls how errors are reported. Accepts one of the following constants:
+Controls how errors are reported. Accepts a `StreamErrorMode` enum value:
 
-  * **STREAM_ERROR_MODE_ERROR** (default) - Use standard PHP error reporting (warnings/notices)
-  * **STREAM_ERROR_MODE_EXCEPTION** - Throw StreamException for terminal errors
-  * **STREAM_ERROR_MODE_SILENT** - Suppress all error output
+  * **StreamErrorMode::Error** (default) - Use standard PHP error reporting (warnings/notices)
+  * **StreamErrorMode::Exception** - Throw StreamException for terminating errors
+  * **StreamErrorMode::Silent** - Suppress all error output
 
-Terminal errors are those that prevent an operation from completing (e.g., file not found, permission denied).
-Non-terminal errors are warnings or notices that don't stop execution (e.g., buffer truncation).
+Terminating errors are those that prevent an operation from completing (e.g., file not found, permission denied).
+Non-terminating errors are warnings or notices that don't stop execution (e.g., buffer truncation).
 
-In exception mode, only terminal errors throw exceptions. Non-terminal errors are still stored (if error_store permits)
-but don't interrupt execution.
+In exception mode, only terminating errors throw exceptions. Non-terminating errors are still stored (if error_store
+permits) but don't interrupt execution.
 
 === error_store ===
 
-Controls which errors are stored for later retrieval via `stream_get_errors()`. Accepts one of:
+Controls which errors are stored for later retrieval via `stream_get_last_error()`. Accepts a `StreamErrorStore` enum
+value:
 
-  * **STREAM_ERROR_STORE_AUTO** (default) - Automatically decide based on error_mode:
-    * With ERROR mode: stores none
-    * With EXCEPTION mode: stores non-terminal errors
-    * With SILENT mode: stores all errors
-  * **STREAM_ERROR_STORE_NONE** - Don't store any errors
-  * **STREAM_ERROR_STORE_NON_TERMINAL** - Store only non-terminal errors
-  * **STREAM_ERROR_STORE_TERMINAL** - Store only terminal errors
-  * **STREAM_ERROR_STORE_ALL** - Store all errors
+  * **StreamErrorStore::Auto** (default) - Automatically decide based on error_mode:
+    * With Error mode: stores none
+    * With Exception mode: stores non-terminating errors
+    * With Silent mode: stores all errors
+  * **StreamErrorStore::None** - Don't store any errors
+  * **StreamErrorStore::NonTerminating** - Store only non-terminating errors
+  * **StreamErrorStore::Terminating** - Store only terminating errors
+  * **StreamErrorStore::All** - Store all errors
 
-Stored errors can be retrieved using `stream_get_errors()` with either a stream resource (for stream-specific errors)
-or wrapper name (for wrapper-level errors).
+Stored errors can be retrieved using `stream_get_last_error()` which returns the most recent error operation.
 
 === error_handler ===
 
-Optional callback to receive error notifications. The callback signature is:
+Optional callback to receive error notifications. The callback receives a single `StreamError` object:
 
 <code php>
-function(string $wrapper, ?resource $stream, int $code, string $message, ?string $param): void
+function(StreamError $error): void
 </code>
-
-Parameters:
-  * **$wrapper** - The wrapper name (e.g., "file", "http", "PHP")
-  * **$stream** - The stream resource if available, null for wrapper-level errors
-  * **$code** - One of the STREAM_ERROR_CODE_* constants
-  * **$message** - Human-readable error message
-  * **$param** - Additional context (typically filename or URL)
 
 The error handler is called regardless of the error_mode setting, allowing custom logging or handling logic.
 
 ==== API ====
 
-=== stream_get_errors Function ===
+=== StreamErrorMode Enum ===
 
 <code php>
 <?php
 
 /**
- * Retrieve stored stream errors
- * 
- * Retrieves errors that have been stored according to the error_store context option.
- * Errors can be retrieved for a specific stream, a specific wrapper, or all wrappers.
- * 
- * @param resource|string|null $subject Optional filter:
- *   - resource: Returns errors for the specific stream
- *   - string: Returns errors for the specified wrapper name
- *   - null: Returns errors for all wrappers
- * 
- * @return array Array of error arrays, each containing:
- *   - 'message' (string): The error message
- *   - 'code' (int): STREAM_ERROR_CODE_* constant
- *   - 'severity' (int): PHP error level (E_WARNING, E_NOTICE, etc.)
- *   - 'terminal' (bool): Whether this is a terminal error
- *   - 'wrapper' (string): Wrapper name
- *   - 'param' (string|null): Additional context if available
- *   - 'docref' (string|null): Documentation reference if available
- * 
- * @throws TypeError If $subject is not a resource, string, or null
+ * Controls how stream errors are reported
  */
-function stream_get_errors($subject = null): array {}
+enum StreamErrorMode
+{
+    /**
+     * Use standard PHP error reporting (warnings, notices)
+     * This is the default mode and maintains backward compatibility.
+     */
+    case Error;
+    
+    /**
+     * Throw StreamException for terminating errors
+     * Non-terminating errors are still reported according to error_store setting.
+     */
+    case Exception;
+    
+    /**
+     * Suppress all error output
+     * Errors can still be stored and retrieved programmatically.
+     */
+    case Silent;
+}
+
+?>
+</code>
+
+=== StreamErrorStore Enum ===
+
+<code php>
+<?php
+
+/**
+ * Controls which stream errors are stored for retrieval
+ */
+enum StreamErrorStore
+{
+    /**
+     * Automatically decide storage based on error_mode
+     * - Error mode: stores none
+     * - Exception mode: stores non-terminating errors
+     * - Silent mode: stores all errors
+     */
+    case Auto;
+    
+    /**
+     * Don't store any errors
+     */
+    case None;
+    
+    /**
+     * Store only non-terminating errors
+     */
+    case NonTerminating;
+    
+    /**
+     * Store only terminating errors
+     */
+    case Terminating;
+    
+    /**
+     * Store all errors (both terminating and non-terminating)
+     */
+    case All;
+}
+
+?>
+</code>
+
+=== StreamErrorCode Enum ===
+
+<code php>
+<?php
+
+/**
+ * Semantic error codes for stream operations
+ */
+enum StreamErrorCode: int
+{
+    // General errors
+    case None = 0;
+    case Generic = 1;
+    
+    // I/O operation errors (10-29)
+    case ReadFailed = 10;
+    case WriteFailed = 11;
+    case SeekFailed = 12;
+    case SeekNotSupported = 13;
+    case FlushFailed = 14;
+    case TruncateFailed = 15;
+    case ConnectFailed = 16;
+    case BindFailed = 17;
+    case ListenFailed = 18;
+    case NotWritable = 19;
+    case NotReadable = 20;
+    
+    // File system operation errors (30-69)
+    case Disabled = 30;
+    case NotFound = 31;
+    case PermissionDenied = 32;
+    case AlreadyExists = 33;
+    case InvalidPath = 34;
+    case PathTooLong = 35;
+    case OpenFailed = 36;
+    case CreateFailed = 37;
+    case DupFailed = 38;
+    case UnlinkFailed = 39;
+    case RenameFailed = 40;
+    case MkdirFailed = 41;
+    case RmdirFailed = 42;
+    case StatFailed = 43;
+    case MetaFailed = 44;
+    case ChmodFailed = 45;
+    case ChownFailed = 46;
+    case CopyFailed = 47;
+    case TouchFailed = 48;
+    case InvalidMode = 49;
+    case InvalidMeta = 50;
+    case ModeNotSupported = 51;
+    case Readonly = 52;
+    case RecursionDetected = 53;
+    
+    // Wrapper/protocol errors (70-89)
+    case NotImplemented = 70;
+    case NoOpener = 71;
+    case PersistentNotSupported = 72;
+    case WrapperNotFound = 73;
+    case WrapperDisabled = 74;
+    case ProtocolUnsupported = 75;
+    case WrapperRegistrationFailed = 76;
+    case WrapperUnregistrationFailed = 77;
+    case WrapperRestorationFailed = 78;
+    
+    // Filter errors (90-99)
+    case FilterNotFound = 90;
+    case FilterFailed = 91;
+    
+    // Cast/conversion errors (100-109)
+    case CastFailed = 100;
+    case CastNotSupported = 101;
+    case MakeSeekableFailed = 102;
+    case BufferedDataLost = 103;
+    
+    // Network/socket errors (110-129)
+    case NetworkSendFailed = 110;
+    case NetworkRecvFailed = 111;
+    case SslNotSupported = 112;
+    case ResumptionFailed = 113;
+    case SocketPathTooLong = 114;
+    case OobNotSupported = 115;
+    case ProtocolError = 116;
+    case InvalidUrl = 117;
+    case InvalidResponse = 118;
+    case InvalidHeader = 119;
+    case InvalidParam = 120;
+    case RedirectLimit = 121;
+    case AuthFailed = 122;
+    
+    // Encoding/decoding errors (130-139)
+    case ArchivingFailed = 130;
+    case EncodingFailed = 131;
+    case DecodingFailed = 132;
+    case InvalidFormat = 133;
+    
+    // Resource/allocation errors (140-149)
+    case AllocationFailed = 140;
+    case TemporaryFileFailed = 141;
+    
+    // Locking errors (150-159)
+    case LockFailed = 150;
+    case LockNotSupported = 151;
+    
+    // Userspace stream errors (160-169)
+    case UserspaceNotImplemented = 160;
+    case UserspaceInvalidReturn = 161;
+    case UserspaceCallFailed = 162;
+    
+    /**
+     * Check if this is an I/O operation error (codes 10-29)
+     */
+    public function isIoError(): bool {}
+    
+    /**
+     * Check if this is a file system error (codes 30-69)
+     */
+    public function isFileSystemError(): bool {}
+    
+    /**
+     * Check if this is a wrapper/protocol error (codes 70-89)
+     */
+    public function isWrapperError(): bool {}
+    
+    /**
+     * Check if this is a filter error (codes 90-99)
+     */
+    public function isFilterError(): bool {}
+    
+    /**
+     * Check if this is a cast/conversion error (codes 100-109)
+     */
+    public function isCastError(): bool {}
+    
+    /**
+     * Check if this is a network/socket error (codes 110-129)
+     */
+    public function isNetworkError(): bool {}
+    
+    /**
+     * Check if this is an encoding/decoding error (codes 130-139)
+     */
+    public function isEncodingError(): bool {}
+    
+    /**
+     * Check if this is a resource/allocation error (codes 140-149)
+     */
+    public function isResourceError(): bool {}
+    
+    /**
+     * Check if this is a locking error (codes 150-159)
+     */
+    public function isLockError(): bool {}
+    
+    /**
+     * Check if this is a userspace stream error (codes 160-169)
+     */
+    public function isUserspaceError(): bool {}
+}
+
+?>
+</code>
+
+=== StreamError Class ===
+
+<code php>
+<?php
+
+/**
+ * Represents a stream error with full context and chaining support
+ * 
+ * StreamError objects are immutable and form a linked list through the $next property,
+ * allowing multiple related errors from a single operation to be represented.
+ */
+final readonly class StreamError
+{
+    /**
+     * The error code
+     */
+    public StreamErrorCode $code;
+    
+    /**
+     * Human-readable error message
+     */
+    public string $message;
+    
+    /**
+     * Name of the stream wrapper that generated the error
+     */
+    public string $wrapperName;
+    
+    /**
+     * PHP error severity level (E_WARNING, E_NOTICE, etc.)
+     */
+    public int $severity;
+    
+    /**
+     * Whether this is a terminating error
+     */
+    public bool $terminating;
+    
+    /**
+     * Additional context (typically filename or URL), or null
+     */
+    public ?string $param;
+    
+    /**
+     * Next error in the chain, or null if this is the last error
+     */
+    public ?StreamError $next;
+    
+    /**
+     * Check if the error chain contains a specific error code
+     * 
+     * Searches through this error and all chained errors for the specified code.
+     * 
+     * @param StreamErrorCode $code The error code to search for
+     * @return bool True if the code is found in the chain
+     */
+    public function hasCode(StreamErrorCode $code): bool {}
+    
+    /**
+     * Count the number of errors in the chain
+     * 
+     * @return int The total number of errors including this one and all chained errors
+     */
+    public function count(): int {}
+}
 
 ?>
 </code>
@@ -119,224 +386,76 @@ function stream_get_errors($subject = null): array {}
 <?php
 
 /**
- * Exception thrown by stream operations in STREAM_ERROR_MODE_EXCEPTION mode
+ * Exception thrown by stream operations in StreamErrorMode::Exception mode
  * 
- * This exception is thrown for terminal errors when a stream context is configured
- * with error_mode set to STREAM_ERROR_MODE_EXCEPTION. It provides structured access
- * to error details including the wrapper name and optional parameter.
+ * This exception is thrown for terminating errors when a stream context is configured
+ * with error_mode set to StreamErrorMode::Exception. It provides structured access
+ * to the complete error chain.
  */
 class StreamException extends Exception
 {
     /**
-     * Get the parameter associated with the error
+     * Get the structured error object
      * 
-     * Returns additional context about the error, typically a filename or URL.
+     * Returns the StreamError object containing full error details and any chained errors.
      * 
-     * @return string|null The parameter or null if not available
+     * @return StreamError|null The error object or null if not available
      */
-    public function getParam(): ?string {}
-    
-    /**
-     * Get the wrapper that generated the error
-     * 
-     * Returns the name of the stream wrapper that encountered the error.
-     * 
-     * @return string The wrapper name (e.g., "file", "http", "ftp")
-     */
-    public function getWrapperName(): string {}
+    public function getError(): ?StreamError {}
 }
 
 ?>
 </code>
 
-=== Error Mode Constants ===
+=== stream_get_last_error Function ===
 
 <code php>
 <?php
 
 /**
- * Use standard PHP error reporting (warnings, notices)
- * This is the default mode and maintains backward compatibility.
+ * Retrieve the most recently stored stream error
+ * 
+ * Returns the most recent error that was stored according to the error_store context option.
+ * Each error may chain to additional related errors through the StreamError::$next property.
+ * 
+ * @return StreamError|null The most recent error or null if no errors are stored
  */
-const STREAM_ERROR_MODE_ERROR = 0;
-
-/**
- * Throw StreamException for terminal errors
- * Non-terminal errors are still reported according to error_store setting.
- */
-const STREAM_ERROR_MODE_EXCEPTION = 1;
-
-/**
- * Suppress all error output
- * Errors can still be stored and retrieved programmatically.
- */
-const STREAM_ERROR_MODE_SILENT = 2;
+function stream_get_last_error(): ?StreamError {}
 
 ?>
 </code>
 
-=== Error Store Constants ===
+==== Error Chaining ====
+
+When a stream operation involves multiple sub-operations (e.g., `stream_select()` calling `stream_cast()` which may
+fail), all errors are captured in a single operation and chained together through the `StreamError::$next` property.
+
+For example, a failed `stream_select()` on a userspace stream might generate:
+1. A non-terminating error from reading too much data
+2. A terminating error that `stream_cast()` is not implemented
+3. A terminating error that the stream type cannot be represented as a descriptor
+
+All three errors are linked together and can be accessed by iterating through the chain:
 
 <code php>
 <?php
 
-/**
- * Automatically decide storage based on error_mode
- * - ERROR mode: stores none
- * - EXCEPTION mode: stores non-terminal errors
- * - SILENT mode: stores all errors
- */
-const STREAM_ERROR_STORE_AUTO = 0;
+$error = stream_get_last_error();
+while ($error) {
+    echo $error->code->name . ": " . $error->message . "\n";
+    $error = $error->next;
+}
 
-/**
- * Don't store any errors
- */
-const STREAM_ERROR_STORE_NONE = 1;
+// Or count them
+$totalErrors = $error->count();
 
-/**
- * Store only non-terminal errors
- */
-const STREAM_ERROR_STORE_NON_TERMINAL = 2;
-
-/**
- * Store only terminal errors
- */
-const STREAM_ERROR_STORE_TERMINAL = 3;
-
-/**
- * Store all errors (both terminal and non-terminal)
- */
-const STREAM_ERROR_STORE_ALL = 4;
+// Or search for specific codes
+if ($error->hasCode(StreamErrorCode::NotImplemented)) {
+    echo "Stream does not implement required functionality\n";
+}
 
 ?>
 </code>
-
-=== Error Code Constants ===
-
-Error codes are organized by operation category to make error handling more intuitive:
-
-<code php>
-<?php
-
-// General errors
-const STREAM_ERROR_CODE_NONE = 0;
-const STREAM_ERROR_CODE_GENERIC = 1;
-
-// I/O operation errors (10-29)
-const STREAM_ERROR_CODE_READ_FAILED = 10;
-const STREAM_ERROR_CODE_WRITE_FAILED = 11;
-const STREAM_ERROR_CODE_SEEK_FAILED = 12;
-const STREAM_ERROR_CODE_SEEK_NOT_SUPPORTED = 13;
-const STREAM_ERROR_CODE_FLUSH_FAILED = 14;
-const STREAM_ERROR_CODE_TRUNCATE_FAILED = 15;
-const STREAM_ERROR_CODE_CONNECT_FAILED = 16;
-const STREAM_ERROR_CODE_BIND_FAILED = 17;
-const STREAM_ERROR_CODE_LISTEN_FAILED = 18;
-const STREAM_ERROR_CODE_NOT_WRITABLE = 19;
-const STREAM_ERROR_CODE_NOT_READABLE = 20;
-
-// File system operation errors (30-69)
-const STREAM_ERROR_CODE_DISABLED = 30;
-const STREAM_ERROR_CODE_NOT_FOUND = 31;
-const STREAM_ERROR_CODE_PERMISSION_DENIED = 32;
-const STREAM_ERROR_CODE_ALREADY_EXISTS = 33;
-const STREAM_ERROR_CODE_INVALID_PATH = 34;
-const STREAM_ERROR_CODE_PATH_TOO_LONG = 35;
-const STREAM_ERROR_CODE_OPEN_FAILED = 36;
-const STREAM_ERROR_CODE_CREATE_FAILED = 37;
-const STREAM_ERROR_CODE_DUP_FAILED = 38;
-const STREAM_ERROR_CODE_UNLINK_FAILED = 39;
-const STREAM_ERROR_CODE_RENAME_FAILED = 40;
-const STREAM_ERROR_CODE_MKDIR_FAILED = 41;
-const STREAM_ERROR_CODE_RMDIR_FAILED = 42;
-const STREAM_ERROR_CODE_STAT_FAILED = 43;
-const STREAM_ERROR_CODE_META_FAILED = 44;
-const STREAM_ERROR_CODE_CHMOD_FAILED = 45;
-const STREAM_ERROR_CODE_CHOWN_FAILED = 46;
-const STREAM_ERROR_CODE_COPY_FAILED = 47;
-const STREAM_ERROR_CODE_TOUCH_FAILED = 48;
-const STREAM_ERROR_CODE_INVALID_MODE = 49;
-const STREAM_ERROR_CODE_INVALID_META = 50;
-const STREAM_ERROR_CODE_MODE_NOT_SUPPORTED = 51;
-const STREAM_ERROR_CODE_READONLY = 52;
-const STREAM_ERROR_CODE_RECURSION_DETECTED = 53;
-
-// Wrapper/protocol errors (70-89)
-const STREAM_ERROR_CODE_NOT_IMPLEMENTED = 70;
-const STREAM_ERROR_CODE_NO_OPENER = 71;
-const STREAM_ERROR_CODE_PERSISTENT_NOT_SUPPORTED = 72;
-const STREAM_ERROR_CODE_WRAPPER_NOT_FOUND = 73;
-const STREAM_ERROR_CODE_WRAPPER_DISABLED = 74;
-const STREAM_ERROR_CODE_PROTOCOL_UNSUPPORTED = 75;
-const STREAM_ERROR_CODE_WRAPPER_REGISTRATION_FAILED = 76;
-const STREAM_ERROR_CODE_WRAPPER_UNREGISTRATION_FAILED = 77;
-const STREAM_ERROR_CODE_WRAPPER_RESTORATION_FAILED = 78;
-
-// Filter errors (90-99)
-const STREAM_ERROR_CODE_FILTER_NOT_FOUND = 90;
-const STREAM_ERROR_CODE_FILTER_FAILED = 91;
-
-// Cast/conversion errors (100-109)
-const STREAM_ERROR_CODE_CAST_FAILED = 100;
-const STREAM_ERROR_CODE_CAST_NOT_SUPPORTED = 101;
-const STREAM_ERROR_CODE_MAKE_SEEKABLE_FAILED = 102;
-const STREAM_ERROR_CODE_BUFFERED_DATA_LOST = 103;
-
-// Network/socket errors (110-129)
-const STREAM_ERROR_CODE_NETWORK_SEND_FAILED = 110;
-const STREAM_ERROR_CODE_NETWORK_RECV_FAILED = 111;
-const STREAM_ERROR_CODE_SSL_NOT_SUPPORTED = 112;
-const STREAM_ERROR_CODE_RESUMPTION_FAILED = 113;
-const STREAM_ERROR_CODE_SOCKET_PATH_TOO_LONG = 114;
-const STREAM_ERROR_CODE_OOB_NOT_SUPPORTED = 115;
-const STREAM_ERROR_CODE_PROTOCOL_ERROR = 116;
-const STREAM_ERROR_CODE_INVALID_URL = 117;
-const STREAM_ERROR_CODE_INVALID_RESPONSE = 118;
-const STREAM_ERROR_CODE_INVALID_HEADER = 119;
-const STREAM_ERROR_CODE_INVALID_PARAM = 120;
-const STREAM_ERROR_CODE_REDIRECT_LIMIT = 121;
-const STREAM_ERROR_CODE_AUTH_FAILED = 122;
-
-// Encoding/decoding errors (130-139)
-const STREAM_ERROR_CODE_ARCHIVING_FAILED = 130;
-const STREAM_ERROR_CODE_ENCODING_FAILED = 131;
-const STREAM_ERROR_CODE_DECODING_FAILED = 132;
-const STREAM_ERROR_CODE_INVALID_FORMAT = 133;
-
-// Resource/allocation errors (140-149)
-const STREAM_ERROR_CODE_ALLOCATION_FAILED = 140;
-const STREAM_ERROR_CODE_TEMPORARY_FILE_FAILED = 141;
-
-// Locking errors (150-159)
-const STREAM_ERROR_CODE_LOCK_FAILED = 150;
-const STREAM_ERROR_CODE_LOCK_NOT_SUPPORTED = 151;
-
-// Userspace stream errors (160-169)
-const STREAM_ERROR_CODE_USERSPACE_NOT_IMPLEMENTED = 160;
-const STREAM_ERROR_CODE_USERSPACE_INVALID_RETURN = 161;
-const STREAM_ERROR_CODE_USERSPACE_CALL_FAILED = 162;
-
-?>
-</code>
-
-==== Stream vs Wrapper Errors ====
-
-The error handling system distinguishes between two types of errors:
-
-**Stream Errors** are associated with a specific stream resource and are stored in the stream itself. These errors can be retrieved by passing the stream resource to `stream_get_errors()`.
-
-**Wrapper Errors** occur during wrapper operations that don't result in a stream (e.g., failed `fopen()` attempts, `unlink()`, `rename()`). These are stored globally per wrapper name and can be retrieved by passing the wrapper name to `stream_get_errors()` or by calling it with no arguments to get all wrapper errors.
-
-This separation allows precise error tracking:
-- Stream errors: `stream_get_errors($stream)`
-- Specific wrapper errors: `stream_get_errors('file')`
-- All wrapper errors: `stream_get_errors()`
-
-==== Logged Errors ====
-
-PHP's stream system has an existing mechanism for "logged errors" that are accumulated during certain operations and
-displayed together (e.g., when `fopen()` fails). This RFC keeps this functionality but the error displaying is done
-through the new error handling so the context options work here as well.
 
 ==== Usage Examples ====
 
@@ -347,7 +466,7 @@ through the new error handling so the context options work here as well.
 
 $context = stream_context_create([
     'stream' => [
-        'error_mode' => STREAM_ERROR_MODE_EXCEPTION,
+        'error_mode' => StreamErrorMode::Exception,
     ]
 ]);
 
@@ -356,8 +475,15 @@ try {
 } catch (StreamException $e) {
     echo "Error: " . $e->getMessage() . "\n";
     echo "Code: " . $e->getCode() . "\n";
-    echo "Wrapper: " . $e->getWrapperName() . "\n";
-    echo "File: " . $e->getParam() . "\n";
+    
+    $error = $e->getError();
+    if ($error) {
+        echo "Wrapper: " . $error->wrapperName . "\n";
+        echo "Error Code: " . $error->code->name . "\n";
+        if ($error->param) {
+            echo "File: " . $error->param . "\n";
+        }
+    }
 }
 
 ?>
@@ -370,22 +496,26 @@ try {
 
 $context = stream_context_create([
     'stream' => [
-        'error_mode' => STREAM_ERROR_MODE_SILENT,
-        'error_store' => STREAM_ERROR_STORE_ALL,
+        'error_mode' => StreamErrorMode::Silent,
+        'error_store' => StreamErrorStore::All,
     ]
 ]);
 
 $stream = @fopen('http://example.com/nonexistent', 'r', false, $context);
 
 if ($stream === false) {
-    $errors = stream_get_errors('http');
+    $error = stream_get_last_error();
     
-    foreach ($errors as $error) {
-        echo "Error {$error['code']}: {$error['message']}\n";
+    if ($error) {
+        echo "Error {$error->code->value}: {$error->message}\n";
         
-        if ($error['code'] === STREAM_ERROR_CODE_NOT_FOUND) {
+        if ($error->code === StreamErrorCode::NotFound) {
             echo "Resource not found, using fallback...\n";
-            // Handle 404 specifically
+        }
+        
+        // Check error category
+        if ($error->code->isNetworkError()) {
+            echo "Network-related error occurred\n";
         }
     }
 }
@@ -402,14 +532,15 @@ $errorLog = [];
 
 $context = stream_context_create([
     'stream' => [
-        'error_mode' => STREAM_ERROR_MODE_SILENT,
-        'error_handler' => function($wrapper, $stream, $code, $message, $param) use (&$errorLog) {
+        'error_mode' => StreamErrorMode::Silent,
+        'error_handler' => function(StreamError $error) use (&$errorLog) {
             $errorLog[] = [
                 'timestamp' => time(),
-                'wrapper' => $wrapper,
-                'code' => $code,
-                'message' => $message,
-                'param' => $param,
+                'wrapper' => $error->wrapperName,
+                'code' => $error->code->name,
+                'message' => $error->message,
+                'param' => $error->param,
+                'count' => $error->count(),
             ];
         }
     ]
@@ -428,53 +559,59 @@ foreach ($files as $file) {
 // Review all errors that occurred
 foreach ($errorLog as $entry) {
     echo "[{$entry['timestamp']}] {$entry['wrapper']}: {$entry['message']}\n";
+    if ($entry['count'] > 1) {
+        echo "  (with {$entry['count']} total errors)\n";
+    }
 }
 
 ?>
 </code>
 
-=== Retrieving Stream-Specific Errors ===
+=== Processing Error Chains ===
 
 <code php>
 <?php
 
 $context = stream_context_create([
     'stream' => [
-        'error_mode' => STREAM_ERROR_MODE_SILENT,
-        'error_store' => STREAM_ERROR_STORE_ALL,
+        'error_mode' => StreamErrorMode::Silent,
+        'error_store' => StreamErrorStore::All,
     ]
 ]);
 
-$stream = fopen('php://temp', 'r+', false, $context);
+// This may generate multiple chained errors
+$read = [$userStream];
+stream_select($read, $write, $except, 0, $context);
 
-// Perform operations that may generate errors
-fwrite($stream, 'test data');
-fseek($stream, -100, SEEK_SET); // This may generate a non-terminal error
+$error = stream_get_last_error();
 
-// Get errors specific to this stream
-$errors = stream_get_errors($stream);
-
-foreach ($errors as $error) {
-    if (!$error['terminal']) {
-        echo "Warning: {$error['message']}\n";
+if ($error) {
+    // Process all errors in the chain
+    $current = $error;
+    while ($current) {
+        echo "- {$current->code->name}: {$current->message}\n";
+        $current = $current->next;
+    }
+    
+    // Or use helper methods
+    echo "Total errors: " . $error->count() . "\n";
+    
+    if ($error->hasCode(StreamErrorCode::CastNotSupported)) {
+        echo "Stream cannot be used with select()\n";
     }
 }
-
-fclose($stream);
 
 ?>
 </code>
 
 === Setting Default Context ===
 
-You can set default error handling for functions that don't accept a context parameter using `stream_context_set_default()`:
-
 <code php>
 <?php
 
 stream_context_set_default([
     'stream' => [
-        'error_mode' => STREAM_ERROR_MODE_EXCEPTION,
+        'error_mode' => StreamErrorMode::Exception,
     ]
 ]);
 
@@ -483,18 +620,11 @@ try {
     $contents = file_get_contents('/nonexistent/file.txt');
 } catch (StreamException $e) {
     echo "Failed to read file: " . $e->getMessage() . "\n";
-}
-
-// Or using silent mode for specific operations
-$silentContext = stream_context_create([
-    'stream' => [
-        'error_mode' => STREAM_ERROR_MODE_SILENT,
-    ]
-]);
-
-if (file_get_contents('/another/file.txt', false, $silentContext) === false) {
-    $errors = stream_get_errors('file');
-    // Handle errors programmatically
+    
+    $error = $e->getError();
+    if ($error && $error->code->isFileSystemError()) {
+        echo "This is a filesystem-related error\n";
+    }
 }
 
 ?>
@@ -502,15 +632,15 @@ if (file_get_contents('/another/file.txt', false, $silentContext) === false) {
 
 ===== Backward Incompatible Changes =====
 
-This RFC only adds new functionality and does not modify existing behavior except small changes noted below.
+This RFC adds new functionality and maintains backward compatibility with existing code. The default behavior
+(StreamErrorMode::Error) preserves all existing error reporting.
 
-There is one case of error that was incorrectly reported and such warning got dropped. There might be a few extra
-warnings that were supposed to be hidden. Those are more fixes however.
+Minor changes:
+  * Some incorrectly reported errors have been fixed
+  * Context is now properly passed to child streams for consistency
+  * Error reporting is delayed closer to the function return which might result in re-ordering of normal errors when combined with non stream errors
 
-Another potentially minor BC break in passing context for opening stream to the new stream. This was done only for
-some wrapper (mainly the network related ones). This should be actually expected for all streams but for some reason it
-wasn't the case. So such change seems to make sense. However, if this becomes a problem, there is a way to make it
-limited to errors or selected options so the impact can be eliminated if needed.
+These changes improve correctness and should not negatively impact existing applications.
 
 ===== Proposed PHP Version(s) =====
 
@@ -521,7 +651,8 @@ PHP 8.6
 This proposal establishes a foundation for future enhancements:
 
   * **Additional error codes** - As new stream operations and wrappers are added
-  * **Error code ranges** - Reserved ranges for extensions to define custom error codes
+  * **Extension-specific error ranges** - Reserved ranges for extensions to define custom error codes
+  * **Error metadata** - Additional context fields for specific error types
 
 ===== Proposed Voting Choices =====
 
@@ -530,13 +661,18 @@ As per the voting RFC, a yes/no vote with a 2/3 majority is needed for this prop
 <doodle title="Should the Stream Error Handling Improvements be added to PHP core?" auth="bukka" voteType="single" closed="true">
    * Yes
    * No
+   * Abstain
 </doodle>
 
 The vote started on 2025-XX-XX at XX:XX UTC and ends on 2025-XX-XX at XX:XX UTC.
 
 ===== Patches and Tests =====
 
-A working implementation is at https://github.com/php/php-src/pull/20524
+A working implementation is at https://github.com/php/php-src/pull/20524 .
+
+The implementation requires some further conversions and addition of operation grouping blocks across the codebase.
+Some parts are already converted but more will come. Those are trivial changes and they just mean that old errors are
+kept in some places or errors might not be grouped.
 
 ===== Implementation =====
 
@@ -552,4 +688,5 @@ After the project is implemented, this section will contain:
 
 ===== Changelog =====
 
+  * 2.0 - Major API redesign with enums, error chaining, and simplified retrieval
   * 1.0 - Initial version
