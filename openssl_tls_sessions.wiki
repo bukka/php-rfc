@@ -1,5 +1,5 @@
 ====== PHP RFC: TLS Session Resumption Support for Streams ======
-  * Version: 0.1
+  * Version: 0.2
   * Date: 2025-10-23
   * Author: Jakub Zelenka, bukka@php.net
   * Status: Under Discussion
@@ -12,11 +12,12 @@ and servers to skip the expensive full handshake by reusing cryptographic parame
 connections.
 
 Currently, PHP's stream wrapper provides limited control over session management. While OpenSSL's
-internal session cache works automatically on the **server side** for some scenarios, developers cannot:
+client session can be copied using stream_socket_enable_crypto session_stream parameter, developers
+cannot:
 
   * Save and restore client sessions across PHP requests
   * Implement custom server-side session storage (Redis, Memcached, databases)
-  * Control session cache behavior
+  * Control session cache behavior and use internal session cache (due to not re-using SSL_CTX)
 
 This proposal exposes OpenSSL's session management APIs through the existing stream context
 options, providing fine-grained control while maintaining backward compatibility.
@@ -24,12 +25,14 @@ options, providing fine-grained control while maintaining backward compatibility
 <PHP>
 <?php
 // Client: Resume previous session for faster reconnection
+$previousSession = $_SESSION['tls_session'] ?? null;
+
 $context = stream_context_create([
     'ssl' => [
         'peer_name' => 'api.example.com',
-        'session_data' => $_SESSION['tls_session'] ?? null,
-        'session_new_cb' => function($stream, $sessionId, $sessionData) {
-            $_SESSION['tls_session'] = $sessionData;
+        'session_data' => $previousSession ? OpenSSLSession::import($previousSession) : null,
+        'session_new_cb' => function($stream, OpenSSLSession $session) {
+            $_SESSION['tls_session'] = $session->export();
         }
     ]
 ]);
@@ -41,33 +44,152 @@ $fp = stream_socket_client('tls://api.example.com:443', context: $context);
 
 ===== Proposal =====
 
+==== OpenSSLSession class ====
+
+The proposal introduces a new class representing an SSL session that is used by new stream context
+options and callbacks. The class wraps an underlying ''SSL_SESSION'' and provides methods for
+inspection, serialization, and import/export.
+
+=== Class Definition ===
+
+<PHP>
+final class OpenSSLSession
+{
+    /** @var string Binary session ID assigned by the server */
+    public readonly string $id;
+
+    /**
+     * Export the session to a portable format.
+     *
+     * @param int $format One of existing OPENSSL_ENCODING_PEM (default) or OPENSSL_ENCODING_DER
+     * @return string Encoded session data
+     * @throws \Exception on export failure
+     */
+    public function export(int $format = OPENSSL_ENCODING_PEM): string {}
+
+    /**
+     * Import a session from previously exported data.
+     *
+     * @param string $data Encoded session data (DER or PEM)
+     * @param int $format One of exiting OPENSSL_ENCODING_PEM (default) or OPENSSL_ENCODING_DER
+     * @return OpenSSLSession
+     * @throws \Exception on import failure
+     */
+    public static function import(string $data, int $format = OPENSSL_ENCODING_PEM): OpenSSLSession {}
+
+    /** Whether this session can be used for resumption */
+    public function isResumable(): bool {}
+
+    /** Session lifetime in seconds as configured by the server */
+    public function getTimeout(): int {}
+
+    /** Unix timestamp of when the session was created */
+    public function getCreatedAt(): int {}
+
+    /** TLS protocol version string (e.g. "TLSv1.3") or null if unknown */
+    public function getProtocol(): ?string {}
+
+    /** Cipher suite name (e.g. "TLS_AES_256_GCM_SHA384") or null */
+    public function getCipher(): ?string {}
+
+    /** Whether the session contains a session ticket */
+    public function hasTicket(): bool {}
+
+    /** Server-suggested ticket lifetime in seconds, or null if no ticket */
+    public function getTicketLifetimeHint(): ?int {}
+
+    /** @internal Serializes to PEM for use with serialize()/unserialize() */
+    public function __serialize(): array {}
+
+    /** @internal Restores from PEM data */
+    public function __unserialize(array $data): void {}
+}
+</PHP>
+
+=== Construction ===
+
+''OpenSSLSession'' cannot be directly instantiated. Instances are obtained through:
+
+  * The ''session_new_cb'' callback (receives an ''OpenSSLSession'' for a newly established session)
+  * ''OpenSSLSession::import()'' (restores a session from previously exported data)
+  * PHP's ''unserialize()'' (restores a session serialized with ''serialize()'')
+
+=== Export/Import Formats ===
+
+Two encoding formats are supported via the existing ''OPENSSL_ENCODING_DER'' and ''OPENSSL_ENCODING_PEM''
+constants:
+
+  * **PEM** (default): Base64-encoded text format, human-readable and suitable for configuration files, text-based storage, and debugging
+  * **DER**: Compact binary format suitable for storage in databases, Redis, or binary-safe caches
+
+<PHP>
+<?php
+// Export as PEM (default, text-based)
+$pem = $session->export(); // or $session->export(OPENSSL_ENCODING_PEM)
+$restored = OpenSSLSession::import($pem);
+
+// Export as DER (compact, binary)
+$der = $session->export(OPENSSL_ENCODING_DER);
+$restored = OpenSSLSession::import($der, OPENSSL_ENCODING_DER);
+
+// PHP serialization also works (uses PEM internally)
+$serialized = serialize($session);
+$restored = unserialize($serialized);
+?>
+</PHP>
+
+=== Introspection ===
+
+The class provides read-only access to session metadata for logging, debugging, and
+cache management:
+
+<PHP>
+<?php
+// Inside session_new_cb
+$newCb = function($stream, OpenSSLSession $session) {
+    echo "Session ID: " . bin2hex($session->id) . "\n";
+    echo "Protocol: " . $session->getProtocol() . "\n";       // "TLSv1.3"
+    echo "Cipher: " . $session->getCipher() . "\n";           // "TLS_AES_256_GCM_SHA384"
+    echo "Resumable: " . ($session->isResumable() ? "yes" : "no") . "\n";
+    echo "Has ticket: " . ($session->hasTicket() ? "yes" : "no") . "\n";
+    echo "Timeout: " . $session->getTimeout() . "s\n";
+    echo "Created: " . date('c', $session->getCreatedAt()) . "\n";
+
+    if ($session->hasTicket()) {
+        echo "Ticket lifetime hint: " . $session->getTicketLifetimeHint() . "s\n";
+    }
+};
+?>
+</PHP>
+
 ==== New Stream Context Options ====
 
 This proposal adds the following SSL stream context options:
 
 === Client-Only Options ===
 
-  * **session_data** (string) - Binary session data from a previous connection to resume. Data must be from a session_new_cb callback.
+  * **session_data** (OpenSSLSession) - Instance of ''OpenSSLSession'' from a previous connection to resume. Data is typically obtained from a ''session_new_cb'' callback and restored via ''OpenSSLSession::import()''.
   * **session_new_cb** (callable) - Callback invoked when a new session is established.
-    * Signature: ''function(resource $stream, string $sessionId, string $sessionData): void''
-    * ''$sessionId'': Binary session identifier
-    * ''$sessionData'': Serialized session (OpenSSL format via i2d_SSL_SESSION)
+    * Signature: ''function(resource $stream, OpenSSLSession $session): void''
+    * ''$stream'': The SSL stream resource
+    * ''$session'': The ''OpenSSLSession'' object representing the new session
 
 === Server-Only Options ===
 
-  * **session_cache** (bool, default: true) - Enable or disable session caching on the server.
+  * **session_cache** (bool, default: true) - Enable or disable internal session caching on the server.
   * **session_cache_size** (int, default: 20480) - Maximum number of sessions in the internal cache. Only applies when using OpenSSL's internal cache.
   * **session_timeout** (int, default: 300) - Session lifetime in seconds.
-  * **session_context_id** (string) - Server identifier for session binding. Required when using external cache callbacks.
+  * **session_id_context** (string) - Server identifier for session binding. Required when ''session_new_cb'' is set with peer verification enabled, and for the internal session cache with peer verification.
   * **session_new_cb** (callable) - Callback invoked when a new session is created. Same signature as client version.
-  * **session_get_cb** (callable) - Callback to retrieve a session from external storage. Requires session_new_cb and session_context_id.
-    * Signature: ''function(resource $stream, string $sessionId): ?string''
-    * Must return session data or null if not found
+  * **session_get_cb** (callable) - Callback to retrieve a session from external storage. Requires ''session_new_cb''.
+    * Signature: ''function(resource $stream, string $sessionId): ?OpenSSLSession''
+    * Must return an ''OpenSSLSession'' instance or null if not found.
   * **session_remove_cb** (callable, optional) - Callback when a session is removed from cache.
     * Signature: ''function(resource $stream, string $sessionId): void''
   * **num_tickets** (int, default: 2, TLS 1.3 only) - Number of session tickets to issue after handshake.
     * Set to 0 to disable all session resumption
     * Higher values (e.g., 4) support connection parallelization
+  * **no_ticket** (bool) - Disable session ticket mechanism (TLS 1.2 Session Tickets / TLS 1.3 NewSessionTicket).
 
 ==== Behavior ====
 
@@ -75,11 +197,12 @@ This proposal adds the following SSL stream context options:
 
 When a client stream is created:
 
-  1. If ''session_data'' is provided, attempt to resume with that session
-  2. If ''session_new_cb'' is provided, call it when a new session is established or received
-  3. Server-only options (''session_get_cb'', ''session_remove_cb'', ''session_cache'', ''num_tickets'', etc.) are ignored
+  1. If ''session_data'' is provided as an ''OpenSSLSession'' instance, attempt to resume with that session
+  2. If ''session_new_cb'' is provided, call it with the stream and an ''OpenSSLSession'' object when a new session is established or a new session ticket is received
+  3. If ''session_stream'' is provided (existing option), the SSL context and session are copied from the provided stream
+  4. When ''session_new_cb'' or ''session_data'' is set, client-side external cache mode is enabled (''SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_NO_INTERNAL'')
 
-**Note:** Client-side session resumption requires explicit management via ''session_data'' and ''session_new_cb''. PHP does not automatically cache sessions on the client side - each connection uses a fresh SSL context unless ''session_data'' is provided.
+**Note:** Client-side session resumption requires either explicit management via ''session_data'' and ''session_new_cb'' or setting ''session_stream'' which copies the session from the provided stream.
 
 === Server Behavior ===
 
@@ -92,11 +215,28 @@ When a server stream is created:
   * ''session_new_cb'' can be provided for notifications without external storage
 
 **With External Cache** (''session_get_cb'' provided):
-  * Disables OpenSSL's internal cache (uses SSL_SESS_CACHE_NO_INTERNAL)
-  * ''session_new_cb'' becomes **required** (E_WARNING if missing)
-  * ''session_context_id'' becomes **required** (E_WARNING if missing)
+  * Disables OpenSSL's internal cache (uses ''SSL_SESS_CACHE_NO_INTERNAL'')
+  * ''session_new_cb'' becomes **required** (ValueError if missing)
+  * Session tickets are disabled (''SSL_OP_NO_TICKET'' is set); attempting to explicitly enable tickets raises ValueError
   * ''session_remove_cb'' is optional
-  * ''session_cache_size'' and ''session_timeout'' are ignored (application manages storage)
+
+**Session Context ID Requirements:**
+  * ''session_id_context'' is required when peer verification is enabled (''SSL_VERIFY_PEER'') and either ''session_new_cb'' or the internal session cache is used
+  * It binds sessions to a specific server context, preventing session reuse across different virtual hosts or applications
+
+==== Error Handling ====
+
+The following validation errors are raised:
+
+  * ''TypeError'' if ''session_new_cb'', ''session_get_cb'', or ''session_remove_cb'' is not a valid callable
+  * ''TypeError'' if ''session_data'' is not an ''OpenSSLSession'' instance
+  * ''TypeError'' if ''session_get_cb'' returns a value that is not ''OpenSSLSession'' or null
+  * ''ValueError'' if ''session_get_cb'' is provided without ''session_new_cb''
+  * ''ValueError'' if ''session_id_context'' is missing when required
+  * ''ValueError'' if ''session_cache_size'' or ''session_timeout'' is not positive
+  * ''ValueError'' if ''no_ticket'' is set to false when ''session_get_cb'' is set
+  * ''E_WARNING'' if callbacks are used with persistent streams (not supported)
+  * ''E_WARNING'' if ''session_data'' contains an ''OpenSSLSession'' with an invalid or expired session (falls back to full handshake)
 
 ==== Examples ====
 
@@ -108,15 +248,14 @@ $sessions = [];
 
 function create_client_context(string $host): resource {
     global $sessions;
-    
+
     return stream_context_create([
         'ssl' => [
             'peer_name' => $host,
             'session_data' => $sessions[$host] ?? null,
-            'session_new_cb' => function($stream, $id, $data) use ($host) {
+            'session_new_cb' => function($stream, OpenSSLSession $session) use ($host) {
                 global $sessions;
-                $sessions[$host] = $data;
-                error_log("Saved session for $host");
+                $sessions[$host] = $session;
             }
         ]
     ]);
@@ -140,6 +279,35 @@ $fp2 = stream_socket_client(
 ?>
 </PHP>
 
+=== Client: Cross-Request Persistence ===
+
+<PHP>
+<?php
+// Save session to file/cache for use in subsequent HTTP requests
+$sessionFile = '/tmp/tls_session_api.pem';
+
+$previousSession = null;
+if (file_exists($sessionFile)) {
+    $previousSession = OpenSSLSession::import(file_get_contents($sessionFile));
+    if (!$previousSession->isResumable()) {
+        $previousSession = null;
+    }
+}
+
+$context = stream_context_create([
+    'ssl' => [
+        'peer_name' => 'api.example.com',
+        'session_data' => $previousSession,
+        'session_new_cb' => function($stream, OpenSSLSession $session) use ($sessionFile) {
+            file_put_contents($sessionFile, $session->export());
+        }
+    ]
+]);
+
+$fp = stream_socket_client('tls://api.example.com:443', context: $context);
+?>
+</PHP>
+
 === Server: Internal Cache (Default Behavior) ===
 
 <PHP>
@@ -149,6 +317,7 @@ $context = stream_context_create([
         'local_cert' => '/path/to/cert.pem',
         'local_pk' => '/path/to/key.pem',
         // Session resumption enabled by default
+        'session_id_context' => 'example.com',
         'session_cache' => true,
         'session_cache_size' => 1024,
         'session_timeout' => 7200,  // 2 hours
@@ -206,20 +375,20 @@ $context = stream_context_create([
     'ssl' => [
         'local_cert' => '/path/to/cert.pem',
         'local_pk' => '/path/to/key.pem',
-        'session_context_id' => 'myapp',
-        
-        'session_new_cb' => function($stream, $id, $data) use ($redis) {
-            $key = 'tls_session:' . bin2hex($id);
-            $redis->setex($key, 7200, $data);
+        'session_id_context' => 'myapp',
+
+        'session_new_cb' => function($stream, OpenSSLSession $session) use ($redis) {
+            $key = 'tls_session:' . bin2hex($session->id);
+            $redis->setex($key, 7200, $session->export());
         },
-        
-        'session_get_cb' => function($stream, $id) use ($redis) {
+
+        'session_get_cb' => function($stream, string $id) use ($redis): ?OpenSSLSession {
             $key = 'tls_session:' . bin2hex($id);
             $result = $redis->get($key);
-            return $result !== false ? $result : null;
+            return $result !== false ? OpenSSLSession::import($result) : null;
         },
-        
-        'session_remove_cb' => function($stream, $id) use ($redis) {
+
+        'session_remove_cb' => function($stream, string $id) use ($redis): void {
             $key = 'tls_session:' . bin2hex($id);
             $redis->del($key);
         },
@@ -256,36 +425,17 @@ $server = stream_socket_server('tls://0.0.0.0:8443', context: $context);
 ?>
 </PHP>
 
-=== Edge Case: Invalid Session Data ===
+===== Session mode differences =====
 
-<PHP>
-<?php
-// Invalid or expired session data is handled gracefully
-$context = stream_context_create([
-    'ssl' => [
-        'peer_name' => 'example.com',
-        'session_data' => 'corrupted_data',  // Invalid
-    ]
-]);
+When session is enabled there are some differences in behaviour that is good to keep in mind.
 
-// E_WARNING emitted, falls back to full handshake
-$fp = stream_socket_client('tls://example.com:443', context: $context);
-?>
-</PHP>
+  * Applications that rely on every connection being a full handshake (rare) might observe different timing characteristics
+  * The SSL_CTX is shared which means that the server certificates are loaded earlier and are not reloaded on subsequent acceptence (this is only if session is used however)
+
 
 ===== Backward Incompatible Changes =====
 
-This RFC introduces **no backward incompatible changes**.
-
-  * All new options are optional and have sensible defaults
-  * Session resumption is already enabled by default in OpenSSL (this RFC just exposes control)
-  * Existing code continues to work without modification
-  * New options are ignored in older PHP versions (standard stream context behavior)
-
-**Potential Considerations:**
-
-  * Applications that rely on every connection being a full handshake (rare) might observe different timing characteristics, but this is already the case with OpenSSL's default behavior
-  * The new callbacks use resources passed as parameters - these must not be stored beyond the callback scope (documented limitation)
+This RFC introduces **no backward incompatible changes** 
 
 ===== Proposed PHP Version(s) =====
 Next PHP 8.5
@@ -302,8 +452,6 @@ No impact to other extensions. Changes are confined to ext openssl's stream tran
 
 **Positive impacts:**
 
-  * **IDEs/Language Servers**: New context options will appear in autocomplete
-  * **Static Analyzers**: Can validate callback signatures and types
   * **HTTP Clients**: Libraries like Guzzle, Symfony HttpClient can optimize performance with session reuse
   * **Async Frameworks**: ReactPHP, Amp, Swoole can benefit from persistent session caching across connections
   * **Microservices**: Service-to-service communication can see significant latency reduction
@@ -325,7 +473,6 @@ This RFC lays the groundwork for future TLS 1.3 enhancements:
   * **PSK (Pre-Shared Key)**: External PSK support for certificate-free authentication
   * **Post-Handshake Authentication**: TLS 1.3 client certificate requests after initial handshake
   * **Ticket Key Rotation**: Callbacks for server-side session ticket key management
-  * **Session Export**: Additional helper functions to inspect session metadata
 
 These features are intentionally excluded from this RFC to maintain focus and allow for iterative development.
 
@@ -344,7 +491,7 @@ Implementation PR: https://github.com/php/php-src/pull/20296
 ===== Implementation =====
 After the project is implemented, this section should contain:
   - the version it was merged into
-  - a link to the git commit(s)  
+  - a link to the git commit(s)
   - a link to the PHP manual entry for the feature
   - a link to the language specification section (if any)
 
@@ -354,21 +501,6 @@ After the project is implemented, this section should contain:
   * [[https://www.openssl.org/docs/man3.0/man3/SSL_CTX_sess_set_new_cb.html|OpenSSL Session Callbacks Documentation]]
   * [[https://www.openssl.org/docs/man3.0/man3/SSL_set_session.html|OpenSSL Session Management API]]
 
-===== Rejected Features =====
-
-**SSL_SESS_CACHE_CLIENT and SSL_SESS_CACHE_BOTH constants**: These OpenSSL cache modes don't map to
-PHP's stream architecture where each connection creates a separate SSL_CTX. Client-side resumption
-is handled explicitly via the ''session_data'' option, making cache-mode constants unnecessary.
-Only boolean ''session_cache'' option is provided for servers.
-
-**Automatic client-side caching**: Considered adding a ''session_cache => true'' option for clients
-that would automatically cache by peer_name, but rejected as it adds magic behavior and state
-management concerns across requests. Developers can easily implement this pattern with
-''session_new_cb'' as shown in examples.
-
-**Session metadata in callbacks**: Discussed passing additional information like protocol version,
-cipher suite, and expiry time to callbacks. Rejected to keep the API simple - developers can use
-OpenSSL functions directly if they need to inspect session details.
-
 ===== Changelog =====
-  * 2025-12-22: Initial RFC published
+  * 0.2 2026-02-13: Updated callback signatures to use OpenSSLSession, session_data and session_get_cb accept only OpenSSLSession
+  * 0.1 2025-12-22: Initial RFC published
