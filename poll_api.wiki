@@ -1,5 +1,5 @@
 ====== PHP RFC: Polling API ======
-  * Version: 1.1
+  * Version: 1.2
   * Date: 2025-10-30
   * Author: Jakub Zelenka, bukka@php.net
   * Status: Under Discussion
@@ -128,7 +128,8 @@ final class Context
      * Create a new poll context
      * 
      * @param Backend $backend The polling backend to use (default: Auto)
-     * @throws FailedContextInitializationException If the context cannot be created
+     * @throws BackendUnavailableException If the backend is not available
+     * @throws FailedContextInitializationException If the context cannot be created for another reason
      */
     public function __construct(Backend $backend = Backend::Auto) {}
 
@@ -149,13 +150,25 @@ final class Context
      * Wait for events on monitored handles
      * 
      * This method blocks until at least one event occurs or the timeout expires.
+     * The timeout follows the same convention as stream_select(): seconds and
+     * microseconds are specified separately, and microsecond values >= 1000000
+     * are allowed with the overflow carried into seconds.
      * 
-     * @param int $timeout Timeout in milliseconds (-1 for infinite, 0 for non-blocking)
+     * @param int $timeoutSeconds Timeout in seconds.
+     *        -1 means wait indefinitely ($timeoutMicroseconds is ignored).
+     *        0 with $timeoutMicroseconds = 0 means return immediately (non-blocking poll).
+     * @param int $timeoutMicroseconds Additional microseconds added to $timeoutSeconds.
+     *        Values >= 1000000 are allowed and the overflow is carried into seconds.
+     *        Must be >= 0. Only used when $timeoutSeconds >= 0.
      * @param int $maxEvents Maximum number of events to return (-1 for backend-specific default)
      * @return array Array of Watcher instances that have triggered events
      * @throws FailedPollWaitException If the wait operation fails
      */
-    public function wait(int $timeout = -1, int $maxEvents = -1): array {}
+    public function wait(
+        int $timeoutSeconds = -1,
+        int $timeoutMicroseconds = 0,
+        int $maxEvents = -1
+    ): array {}
 
     /**
      * Get the active polling backend
@@ -290,7 +303,7 @@ abstract class Handle
      * 
      * @return int The file descriptor number
      */
-    protected function getFileDescriptor(): int {}
+    abstract protected function getFileDescriptor(): int;
 }
 </code>
 
@@ -325,6 +338,13 @@ final class StreamPollHandle extends \Io\Poll\Handle
      * @return bool True if the stream is still valid and not EOF, false otherwise
      */
     public function isValid(): bool {}
+
+    /**
+     * Get the stream file descriptor
+     * 
+     * @return int The file descriptor number
+     */
+    protected function getFileDescriptor(): int {}
 }
 </code>
 
@@ -482,6 +502,11 @@ class FailedWatcherModificationException extends FailedPollOperationException {}
 class FailedPollWaitException extends FailedPollOperationException {}
 
 /**
+ * Backend not available on the executed platform
+ */
+class BackendUnavailableException extends PollException {}
+
+/**
  * Operation attempted on inactive watcher
  */
 class InactiveWatcherException extends PollException {}
@@ -553,9 +578,8 @@ $poll->add($serverHandle, [Event::Read], ['type' => 'server']);
 echo "Server listening on port 8080\n";
 
 while (true) {
-    // Wait for events (timeout in milliseconds, -1 = infinite)
     // Returns array of Watcher instances that have events
-    $watchers = $poll->wait(1000);
+    $watchers = $poll->wait(1);
     
     foreach ($watchers as $watcher) {
         $data = $watcher->getData();
@@ -610,13 +634,13 @@ while (true) {
 
 use Io\Poll\{Context, Event};
 
-function sendAndReceive($poll, $watcher, $client, $message, $timeout = 5000) {
+function sendAndReceive($poll, $client, $message, $timeoutSeconds = 5) {
     // Send message to server
     fwrite($client, $message);
     echo "Sent: $message";
     
     // Wait for response
-    $watchers = $poll->wait($timeout);
+    $watchers = $poll->wait($timeoutSeconds);
     
     if (empty($watchers)) {
         echo "Timeout waiting for response\n";
@@ -660,7 +684,7 @@ $watcher = $poll->add($handle, [Event::Read]);
 // Send messages to the server
 $messages = ["Hello, Server!\n", "How are you?\n", "Goodbye!\n"];
 foreach ($messages as $message) {
-    if (!sendAndReceive($poll, $watcher, $client, $message)) {
+    if (!sendAndReceive($poll, $client, $message)) {
         break;
     }
     
@@ -830,8 +854,8 @@ $watcher = $poll->add($handle, [Event::Read, Event::EdgeTriggered]);
 while (true) {
     $watchers = $poll->wait();
     
-    foreach ($watchers as $watcher) {
-        if ($watcher->hasTriggered(Event::Read)) {
+    foreach ($watchers as $w) {
+        if ($w->hasTriggered(Event::Read)) {
             // In ET mode, read until EAGAIN
             while (($data = fread($stream, 8192)) !== false && $data !== '') {
                 process_data($data);
@@ -902,8 +926,10 @@ zend_result php_poll_modify(php_poll_ctx *ctx, int fd, uint32_t events, void *da
 /* Remove a file descriptor from monitoring */
 zend_result php_poll_remove(php_poll_ctx *ctx, int fd);
 
-/* Wait for events with timeout */
-int php_poll_wait(php_poll_ctx *ctx, php_poll_event *events, int max_events, int timeout);
+/* Wait for events with timeout
+ * timeout: NULL for infinite wait, pointer to {0,0} for non-blocking, or specific duration */
+int php_poll_wait(php_poll_ctx *ctx, php_poll_event *events, int max_events,
+        const struct timespec *timeout);
 
 /* Destroy the context and free resources */
 void php_poll_destroy(php_poll_ctx *ctx);
@@ -970,6 +996,7 @@ As per the voting RFC, a yes/no vote with a 2/3 majority is needed for this prop
 <doodle title="Should the Polling API be added to PHP core?" auth="bukka" voteType="single" closed="true">
    * Yes
    * No
+   * Abstain
 </doodle>
 
 The vote started on 2025-XX-XX at XX:XX UTC and ends on 2025-XX-XX at XX:XX UTC.
@@ -996,5 +1023,6 @@ After the project is implemented, this section will contain:
 
 ===== Changelog =====
 
+  * 1.2 - Changed wait() timeout from milliseconds to seconds + microseconds, use struct timespec internally, introduce BackendUnavailableException
   * 1.1 - Updated with better motivation explanation, polling overview, target audience clarification, fixed examples
   * 1.0 - Initial version
