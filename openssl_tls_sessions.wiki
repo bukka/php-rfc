@@ -168,7 +168,7 @@ This proposal adds the following SSL stream context options:
 
 === Client-Only Options ===
 
-  * **session_data** (OpenSSLSession) - Instance of ''OpenSSLSession'' from a previous connection to resume. Data is typically obtained from a ''session_new_cb'' callback and restored via ''OpenSSLSession::import()''.
+  * **session_data** (?OpenSSLSession) - Instance of ''OpenSSLSession'' from a previous connection to resume. Data is typically obtained from a ''session_new_cb'' callback and restored via ''OpenSSLSession::import()''. The null value is ignored.
   * **session_new_cb** (callable) - Callback invoked when a new session is established.
     * Signature: ''function(resource $stream, OpenSSLSession $session): void''
     * ''$stream'': The SSL stream resource
@@ -502,5 +502,5 @@ After the project is implemented, this section should contain:
   * [[https://www.openssl.org/docs/man3.0/man3/SSL_set_session.html|OpenSSL Session Management API]]
 
 ===== Changelog =====
-  * 0.2 2026-02-13: Updated callback signatures to use OpenSSLSession, session_data and session_get_cb accept only OpenSSLSession
+  * 0.2 2026-02-13: Updated callback signatures to use OpenSSLSession, session_data and session_get_cb accept only OpenSSLSession and other changes
   * 0.1 2025-12-22: Initial RFC published
