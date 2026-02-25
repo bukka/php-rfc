@@ -959,7 +959,11 @@ This allows extensions to integrate their resources seamlessly with the polling 
 
 ===== Backward Incompatible Changes =====
   
-None. This RFC only adds new functionality and does not modify existing APIs.
+This RFC only adds new functionality and does not modify existing APIs.
+
+It introduces a new namespace Io. No major project uses this namespace. There have been found only
+one active projects on GitHub - https://github.com/plentymarkets/plugin-io. It uses it as the primary
+namespace but does not use Io\Poll or any planned Io subnamspaces so there is no conflict.
 
 ===== Proposed PHP Version(s) =====
 
