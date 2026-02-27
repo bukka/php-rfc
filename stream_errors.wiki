@@ -1,5 +1,5 @@
 ====== PHP RFC: Stream Error Handling Improvements ======
-  * Version: 2.0
+  * Version: 2.1
   * Date: 2025-11-18
   * Author: Jakub Zelenka, bukka@php.net
   * Status: Under Discussion
@@ -21,7 +21,7 @@ This RFC proposes a unified error handling system for PHP streams that provides:
   * **Multiple error modes** - traditional warnings, exceptions, or silent mode
   * **Structured error storage** - retrieve detailed error information programmatically
   * **Custom error handlers** - error callback support with structured error objects
-  * **Semantic error codes** - well-defined enum-based codes for different error conditions
+  * **Semantic error codes** - well-defined integer constants for different error conditions
   * **Error chaining** - track multiple related errors in a single operation
 
 ===== Proposal =====
@@ -46,6 +46,11 @@ Non-terminating errors are warnings or notices that don't stop execution (e.g., 
 
 In exception mode, only terminating errors throw exceptions. Non-terminating errors are still stored (if error_store
 permits) but don't interrupt execution.
+
+Error handling options (`error_mode` and `error_store`) cannot be set on the default context via
+`stream_context_set_default()`. This restriction prevents backward compatibility issues with libraries that rely on
+stream warnings being emitted in the default configuration. Error handling must always be configured through an
+explicit context created with `stream_context_create()`.
 
 === error_store ===
 
@@ -72,6 +77,19 @@ function(StreamError $error): void
 </code>
 
 The error handler is called regardless of the error_mode setting, allowing custom logging or handling logic.
+
+==== Context Parameter Additions ====
+
+Several stream functions that previously had no way to specify a stream context now accept an optional `$context`
+parameter. This allows error handling options to be used with these functions:
+
+  * **stream_select()** - new `$context` parameter (6th argument)
+  * **stream_copy_to_stream()** - new `$context` parameter (5th argument)
+  * **stream_socket_pair()** - new `$context` parameter (4th argument)
+  * **stream_is_local()** - new `$context` parameter (2nd argument)
+
+The `$context` parameter is optional and defaults to `null` (no context). When provided, errors from these functions
+are reported according to the context's error handling configuration.
 
 ==== API ====
 
@@ -149,113 +167,159 @@ enum StreamErrorStore
 ?>
 </code>
 
-=== StreamErrorCode Enum ===
+=== StreamError Class ===
 
 <code php>
 <?php
 
 /**
- * Semantic error codes for stream operations
+ * Represents a stream error with full context and chaining support
+ * 
+ * StreamError objects are immutable and form a linked list through the $next property,
+ * allowing multiple related errors from a single operation to be represented.
  */
-enum StreamErrorCode: int
+final readonly class StreamError
 {
     // General errors
-    case None = 0;
-    case Generic = 1;
+    const int CODE_NONE = 0;
+    const int CODE_GENERIC = 1;
     
     // I/O operation errors (10-29)
-    case ReadFailed = 10;
-    case WriteFailed = 11;
-    case SeekFailed = 12;
-    case SeekNotSupported = 13;
-    case FlushFailed = 14;
-    case TruncateFailed = 15;
-    case ConnectFailed = 16;
-    case BindFailed = 17;
-    case ListenFailed = 18;
-    case NotWritable = 19;
-    case NotReadable = 20;
+    const int CODE_READ_FAILED = 10;
+    const int CODE_WRITE_FAILED = 11;
+    const int CODE_SEEK_FAILED = 12;
+    const int CODE_SEEK_NOT_SUPPORTED = 13;
+    const int CODE_FLUSH_FAILED = 14;
+    const int CODE_TRUNCATE_FAILED = 15;
+    const int CODE_CONNECT_FAILED = 16;
+    const int CODE_BIND_FAILED = 17;
+    const int CODE_LISTEN_FAILED = 18;
+    const int CODE_NOT_WRITABLE = 19;
+    const int CODE_NOT_READABLE = 20;
     
     // File system operation errors (30-69)
-    case Disabled = 30;
-    case NotFound = 31;
-    case PermissionDenied = 32;
-    case AlreadyExists = 33;
-    case InvalidPath = 34;
-    case PathTooLong = 35;
-    case OpenFailed = 36;
-    case CreateFailed = 37;
-    case DupFailed = 38;
-    case UnlinkFailed = 39;
-    case RenameFailed = 40;
-    case MkdirFailed = 41;
-    case RmdirFailed = 42;
-    case StatFailed = 43;
-    case MetaFailed = 44;
-    case ChmodFailed = 45;
-    case ChownFailed = 46;
-    case CopyFailed = 47;
-    case TouchFailed = 48;
-    case InvalidMode = 49;
-    case InvalidMeta = 50;
-    case ModeNotSupported = 51;
-    case Readonly = 52;
-    case RecursionDetected = 53;
+    const int CODE_DISABLED = 30;
+    const int CODE_NOT_FOUND = 31;
+    const int CODE_PERMISSION_DENIED = 32;
+    const int CODE_ALREADY_EXISTS = 33;
+    const int CODE_INVALID_PATH = 34;
+    const int CODE_PATH_TOO_LONG = 35;
+    const int CODE_OPEN_FAILED = 36;
+    const int CODE_CREATE_FAILED = 37;
+    const int CODE_DUP_FAILED = 38;
+    const int CODE_UNLINK_FAILED = 39;
+    const int CODE_RENAME_FAILED = 40;
+    const int CODE_MKDIR_FAILED = 41;
+    const int CODE_RMDIR_FAILED = 42;
+    const int CODE_STAT_FAILED = 43;
+    const int CODE_META_FAILED = 44;
+    const int CODE_CHMOD_FAILED = 45;
+    const int CODE_CHOWN_FAILED = 46;
+    const int CODE_COPY_FAILED = 47;
+    const int CODE_TOUCH_FAILED = 48;
+    const int CODE_INVALID_MODE = 49;
+    const int CODE_INVALID_META = 50;
+    const int CODE_MODE_NOT_SUPPORTED = 51;
+    const int CODE_READONLY = 52;
+    const int CODE_RECURSION_DETECTED = 53;
     
     // Wrapper/protocol errors (70-89)
-    case NotImplemented = 70;
-    case NoOpener = 71;
-    case PersistentNotSupported = 72;
-    case WrapperNotFound = 73;
-    case WrapperDisabled = 74;
-    case ProtocolUnsupported = 75;
-    case WrapperRegistrationFailed = 76;
-    case WrapperUnregistrationFailed = 77;
-    case WrapperRestorationFailed = 78;
+    const int CODE_NOT_IMPLEMENTED = 70;
+    const int CODE_NO_OPENER = 71;
+    const int CODE_PERSISTENT_NOT_SUPPORTED = 72;
+    const int CODE_WRAPPER_NOT_FOUND = 73;
+    const int CODE_WRAPPER_DISABLED = 74;
+    const int CODE_PROTOCOL_UNSUPPORTED = 75;
+    const int CODE_WRAPPER_REGISTRATION_FAILED = 76;
+    const int CODE_WRAPPER_UNREGISTRATION_FAILED = 77;
+    const int CODE_WRAPPER_RESTORATION_FAILED = 78;
     
     // Filter errors (90-99)
-    case FilterNotFound = 90;
-    case FilterFailed = 91;
+    const int CODE_FILTER_NOT_FOUND = 90;
+    const int CODE_FILTER_FAILED = 91;
     
     // Cast/conversion errors (100-109)
-    case CastFailed = 100;
-    case CastNotSupported = 101;
-    case MakeSeekableFailed = 102;
-    case BufferedDataLost = 103;
+    const int CODE_CAST_FAILED = 100;
+    const int CODE_CAST_NOT_SUPPORTED = 101;
+    const int CODE_MAKE_SEEKABLE_FAILED = 102;
+    const int CODE_BUFFERED_DATA_LOST = 103;
     
     // Network/socket errors (110-129)
-    case NetworkSendFailed = 110;
-    case NetworkRecvFailed = 111;
-    case SslNotSupported = 112;
-    case ResumptionFailed = 113;
-    case SocketPathTooLong = 114;
-    case OobNotSupported = 115;
-    case ProtocolError = 116;
-    case InvalidUrl = 117;
-    case InvalidResponse = 118;
-    case InvalidHeader = 119;
-    case InvalidParam = 120;
-    case RedirectLimit = 121;
-    case AuthFailed = 122;
+    const int CODE_NETWORK_SEND_FAILED = 110;
+    const int CODE_NETWORK_RECV_FAILED = 111;
+    const int CODE_SSL_NOT_SUPPORTED = 112;
+    const int CODE_RESUMPTION_FAILED = 113;
+    const int CODE_SOCKET_PATH_TOO_LONG = 114;
+    const int CODE_OOB_NOT_SUPPORTED = 115;
+    const int CODE_PROTOCOL_ERROR = 116;
+    const int CODE_INVALID_URL = 117;
+    const int CODE_INVALID_RESPONSE = 118;
+    const int CODE_INVALID_HEADER = 119;
+    const int CODE_INVALID_PARAM = 120;
+    const int CODE_REDIRECT_LIMIT = 121;
+    const int CODE_AUTH_FAILED = 122;
     
     // Encoding/decoding errors (130-139)
-    case ArchivingFailed = 130;
-    case EncodingFailed = 131;
-    case DecodingFailed = 132;
-    case InvalidFormat = 133;
+    const int CODE_ARCHIVING_FAILED = 130;
+    const int CODE_ENCODING_FAILED = 131;
+    const int CODE_DECODING_FAILED = 132;
+    const int CODE_INVALID_FORMAT = 133;
     
     // Resource/allocation errors (140-149)
-    case AllocationFailed = 140;
-    case TemporaryFileFailed = 141;
+    const int CODE_ALLOCATION_FAILED = 140;
+    const int CODE_TEMPORARY_FILE_FAILED = 141;
     
     // Locking errors (150-159)
-    case LockFailed = 150;
-    case LockNotSupported = 151;
+    const int CODE_LOCK_FAILED = 150;
+    const int CODE_LOCK_NOT_SUPPORTED = 151;
     
     // Userspace stream errors (160-169)
-    case UserspaceNotImplemented = 160;
-    case UserspaceInvalidReturn = 161;
-    case UserspaceCallFailed = 162;
+    const int CODE_USERSPACE_NOT_IMPLEMENTED = 160;
+    const int CODE_USERSPACE_INVALID_RETURN = 161;
+    const int CODE_USERSPACE_CALL_FAILED = 162;
+    
+    /**
+     * The error code (one of the StreamError::CODE_* constants)
+     */
+    public int $code;
+    
+    /**
+     * Human-readable error message
+     */
+    public string $message;
+    
+    /**
+     * Name of the stream wrapper that generated the error
+     */
+    public string $wrapperName;
+    
+    /**
+     * PHP error severity level (E_WARNING, E_NOTICE, etc.)
+     */
+    public int $severity;
+    
+    /**
+     * Whether this is a terminating error
+     */
+    public bool $terminating;
+    
+    /**
+     * Additional context (typically filename or URL), or null
+     */
+    public ?string $param;
+    
+    /**
+     * Next error in the chain, or null if this is the last error
+     *
+     * The chain is ordered so that the first (most significant) error is returned directly
+     * and subsequent, typically less critical errors follow through the $next chain. This
+     * ordering is intentional: the primary error that caused the operation to fail is the
+     * most useful for error handling and is immediately available without traversal. Follow-up
+     * errors (e.g., cascading failures from sub-operations) are linked for completeness but
+     * are rarely needed in practice. This is the opposite of Exception::$previous because
+     * exceptions chain from effect to cause, while stream errors chain from cause to effect.
+     */
+    public ?StreamError $next;
     
     /**
      * Check if this is an I/O operation error (codes 10-29)
@@ -306,68 +370,16 @@ enum StreamErrorCode: int
      * Check if this is a userspace stream error (codes 160-169)
      */
     public function isUserspaceError(): bool {}
-}
-
-?>
-</code>
-
-=== StreamError Class ===
-
-<code php>
-<?php
-
-/**
- * Represents a stream error with full context and chaining support
- * 
- * StreamError objects are immutable and form a linked list through the $next property,
- * allowing multiple related errors from a single operation to be represented.
- */
-final readonly class StreamError
-{
-    /**
-     * The error code
-     */
-    public StreamErrorCode $code;
-    
-    /**
-     * Human-readable error message
-     */
-    public string $message;
-    
-    /**
-     * Name of the stream wrapper that generated the error
-     */
-    public string $wrapperName;
-    
-    /**
-     * PHP error severity level (E_WARNING, E_NOTICE, etc.)
-     */
-    public int $severity;
-    
-    /**
-     * Whether this is a terminating error
-     */
-    public bool $terminating;
-    
-    /**
-     * Additional context (typically filename or URL), or null
-     */
-    public ?string $param;
-    
-    /**
-     * Next error in the chain, or null if this is the last error
-     */
-    public ?StreamError $next;
     
     /**
      * Check if the error chain contains a specific error code
      * 
      * Searches through this error and all chained errors for the specified code.
      * 
-     * @param StreamErrorCode $code The error code to search for
+     * @param int $code The error code to search for (use StreamError::CODE_* constants)
      * @return bool True if the code is found in the chain
      */
-    public function hasCode(StreamErrorCode $code): bool {}
+    public function hasCode(int $code): bool {}
     
     /**
      * Count the number of errors in the chain
@@ -425,10 +437,38 @@ function stream_get_last_error(): ?StreamError {}
 ?>
 </code>
 
+==== Error Codes ====
+
+Error codes are defined as integer class constants on `StreamError` with the `CODE_` prefix. They are organized into
+ranges by category:
+
+^ Range   ^ Category                     ^ Example Constants                                       ^
+| 0-1     | General                      | `CODE_NONE`, `CODE_GENERIC`                             |
+| 10-29   | I/O operations               | `CODE_READ_FAILED`, `CODE_WRITE_FAILED`                 |
+| 30-69   | File system operations        | `CODE_NOT_FOUND`, `CODE_PERMISSION_DENIED`              |
+| 70-89   | Wrapper/protocol operations   | `CODE_NOT_IMPLEMENTED`, `CODE_WRAPPER_NOT_FOUND`        |
+| 90-99   | Filter operations             | `CODE_FILTER_NOT_FOUND`, `CODE_FILTER_FAILED`           |
+| 100-109 | Cast/conversion operations    | `CODE_CAST_FAILED`, `CODE_CAST_NOT_SUPPORTED`           |
+| 110-129 | Network/socket operations     | `CODE_NETWORK_SEND_FAILED`, `CODE_PROTOCOL_ERROR`       |
+| 130-139 | Encoding/decoding operations  | `CODE_ENCODING_FAILED`, `CODE_DECODING_FAILED`          |
+| 140-149 | Resource/allocation operations| `CODE_ALLOCATION_FAILED`, `CODE_TEMPORARY_FILE_FAILED`  |
+| 150-159 | Locking operations            | `CODE_LOCK_FAILED`, `CODE_LOCK_NOT_SUPPORTED`           |
+| 160-169 | Userspace stream operations   | `CODE_USERSPACE_NOT_IMPLEMENTED`                        |
+
+The `is*Error()` convenience methods on `StreamError` check whether the error's code falls within the corresponding
+range.
+
 ==== Error Chaining ====
 
 When a stream operation involves multiple sub-operations (e.g., `stream_select()` calling `stream_cast()` which may
 fail), all errors are captured in a single operation and chained together through the `StreamError::$next` property.
+
+The chain is ordered from most significant to least significant: the primary error that caused the operation to fail
+is returned directly, and follow-up errors from sub-operations are accessible through `$next`. This is the opposite
+of `Exception::$previous` which chains from effect to cause. The rationale is that for stream errors, the first error
+is almost always the most useful for error handling, and subsequent errors are linked for completeness but are rarely
+needed in practice. Using a linked list rather than an array reinforces this design - the primary error is immediately
+available without any array access, and the chain can be traversed when the additional context is needed.
 
 For example, a failed `stream_select()` on a userspace stream might generate:
 1. A non-terminating error from reading too much data
@@ -442,7 +482,7 @@ All three errors are linked together and can be accessed by iterating through th
 
 $error = stream_get_last_error();
 while ($error) {
-    echo $error->code->name . ": " . $error->message . "\n";
+    echo StreamError::CODE_GENERIC . ": " . $error->message . "\n";
     $error = $error->next;
 }
 
@@ -450,7 +490,7 @@ while ($error) {
 $totalErrors = $error->count();
 
 // Or search for specific codes
-if ($error->hasCode(StreamErrorCode::NotImplemented)) {
+if ($error->hasCode(StreamError::CODE_NOT_IMPLEMENTED)) {
     echo "Stream does not implement required functionality\n";
 }
 
@@ -479,7 +519,7 @@ try {
     $error = $e->getError();
     if ($error) {
         echo "Wrapper: " . $error->wrapperName . "\n";
-        echo "Error Code: " . $error->code->name . "\n";
+        echo "Error Code: " . $error->code . "\n";
         if ($error->param) {
             echo "File: " . $error->param . "\n";
         }
@@ -507,14 +547,14 @@ if ($stream === false) {
     $error = stream_get_last_error();
     
     if ($error) {
-        echo "Error {$error->code->value}: {$error->message}\n";
+        echo "Error {$error->code}: {$error->message}\n";
         
-        if ($error->code === StreamErrorCode::NotFound) {
+        if ($error->code === StreamError::CODE_NOT_FOUND) {
             echo "Resource not found, using fallback...\n";
         }
         
         // Check error category
-        if ($error->code->isNetworkError()) {
+        if ($error->isNetworkError()) {
             echo "Network-related error occurred\n";
         }
     }
@@ -537,7 +577,7 @@ $context = stream_context_create([
             $errorLog[] = [
                 'timestamp' => time(),
                 'wrapper' => $error->wrapperName,
-                'code' => $error->code->name,
+                'code' => $error->code,
                 'message' => $error->message,
                 'param' => $error->param,
                 'count' => $error->count(),
@@ -581,7 +621,9 @@ $context = stream_context_create([
 
 // This may generate multiple chained errors
 $read = [$userStream];
-stream_select($read, $write, $except, 0, $context);
+$write = NULL;
+$except = NULL;
+stream_select($read, $write, $except, 0, 0, $context);
 
 $error = stream_get_last_error();
 
@@ -589,14 +631,14 @@ if ($error) {
     // Process all errors in the chain
     $current = $error;
     while ($current) {
-        echo "- {$current->code->name}: {$current->message}\n";
+        echo "- [{$current->code}]: {$current->message}\n";
         $current = $current->next;
     }
     
     // Or use helper methods
     echo "Total errors: " . $error->count() . "\n";
     
-    if ($error->hasCode(StreamErrorCode::CastNotSupported)) {
+    if ($error->hasCode(StreamError::CODE_CAST_NOT_SUPPORTED)) {
         echo "Stream cannot be used with select()\n";
     }
 }
@@ -604,26 +646,27 @@ if ($error) {
 ?>
 </code>
 
-=== Setting Default Context ===
+=== Using Context with stream_copy_to_stream ===
 
 <code php>
 <?php
 
-stream_context_set_default([
+$context = stream_context_create([
     'stream' => [
         'error_mode' => StreamErrorMode::Exception,
     ]
 ]);
 
-// Now all stream operations use exception mode by default
 try {
-    $contents = file_get_contents('/nonexistent/file.txt');
+    $src = fopen('source.txt', 'r', false, $context);
+    $dst = fopen('dest.txt', 'w', false, $context);
+    stream_copy_to_stream($src, $dst, null, 0, $context);
 } catch (StreamException $e) {
-    echo "Failed to read file: " . $e->getMessage() . "\n";
+    echo "Copy failed: " . $e->getMessage() . "\n";
     
     $error = $e->getError();
-    if ($error && $error->code->isFileSystemError()) {
-        echo "This is a filesystem-related error\n";
+    if ($error && $error->isIoError()) {
+        echo "I/O error during copy\n";
     }
 }
 
@@ -653,6 +696,7 @@ This proposal establishes a foundation for future enhancements:
   * **Additional error codes** - As new stream operations and wrappers are added
   * **Extension-specific error ranges** - Reserved ranges for extensions to define custom error codes
   * **Error metadata** - Additional context fields for specific error types
+  * **Context parameter for more functions** - Additional stream functions may gain optional `$context` parameters to enable error handling configuration where currently not possible
 
 ===== Proposed Voting Choices =====
 
@@ -688,5 +732,6 @@ After the project is implemented, this section will contain:
 
 ===== Changelog =====
 
+  * 2.1 - Replace StreamErrorCode enum with StreamError class constants (CODE_* prefix), move is*Error() methods to StreamError, prohibit error handling options on default context, add context parameter to some stream functions
   * 2.0 - Major API redesign with enums, error chaining, and simplified retrieval
   * 1.0 - Initial version
