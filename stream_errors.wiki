@@ -50,7 +50,8 @@ permits) but don't interrupt execution.
 Error handling options (`error_mode` and `error_store`) cannot be set on the default context via
 `stream_context_set_default()`. This restriction prevents backward compatibility issues with libraries that rely on
 stream warnings being emitted in the default configuration. Error handling must always be configured through an
-explicit context created with `stream_context_create()`.
+explicit context created with `stream_context_create()`. If `stream_context_set_default()` is used for setting
+`error_mode`, `error_store` or `error_handler`, the `ValueError` exception is thrown.
 
 === error_store ===
 
