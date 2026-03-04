@@ -1,5 +1,5 @@
 ====== PHP RFC: TLS Session Resumption Support for Streams ======
-  * Version: 0.2
+  * Version: 0.3
   * Date: 2025-10-23
   * Author: Jakub Zelenka, bukka@php.net
   * Status: Under Discussion
@@ -44,6 +44,33 @@ $fp = stream_socket_client('tls://api.example.com:443', context: $context);
 
 ===== Proposal =====
 
+==== OpenSSLException class ====
+
+This RFC introduces a new ''OpenSSLException'' class as the base exception for the OpenSSL
+extension. This follows the [[https://github.com/php/policies/blob/main/coding-standards-and-naming.rst#throwables|Throwable policy]]
+which requires extensions to use extension-specific exception classes rather than the base
+''\Exception''.
+
+=== Class Definition ===
+
+<PHP>
+class OpenSSLException extends \Exception {}
+</PHP>
+
+The ''OpenSSLException'' class name was chosen for consistency with the existing non-namespaced
+OpenSSL symbols (''OpenSSLCertificate'', ''OpenSSLCertificateSigningRequest'',
+''OpenSSLAsymmetricKey''). However, two secondary votes are included in this RFC to allow
+the community to decide on the final naming of both the exception class and the session class
+(see [[#voting_choices|Voting Choices]]).
+
+''OpenSSLException'' is used by the ''OpenSSLSession'' class methods and may be used by future
+OpenSSL extension additions. It is thrown in the following cases:
+
+  * ''OpenSSLSession::import()'' - when the provided data cannot be decoded or parsed
+  * ''OpenSSLSession::export()'' - when the session encoding fails (DER or PEM) or internal BIO allocation fails
+  * ''OpenSSLSession::__serialize()'' - when the session PEM encoding fails
+  * ''OpenSSLSession::__unserialize()'' - when the serialization data is invalid or the session cannot be restored
+
 ==== OpenSSLSession class ====
 
 The proposal introduces a new class representing an SSL session that is used by new stream context
@@ -63,7 +90,7 @@ final class OpenSSLSession
      *
      * @param int $format One of existing OPENSSL_ENCODING_PEM (default) or OPENSSL_ENCODING_DER
      * @return string Encoded session data
-     * @throws \Exception on export failure
+     * @throws OpenSSLException on export failure
      */
     public function export(int $format = OPENSSL_ENCODING_PEM): string {}
 
@@ -73,7 +100,7 @@ final class OpenSSLSession
      * @param string $data Encoded session data (DER or PEM)
      * @param int $format One of exiting OPENSSL_ENCODING_PEM (default) or OPENSSL_ENCODING_DER
      * @return OpenSSLSession
-     * @throws \Exception on import failure
+     * @throws OpenSSLException on import failure
      */
     public static function import(string $data, int $format = OPENSSL_ENCODING_PEM): OpenSSLSession {}
 
@@ -98,10 +125,16 @@ final class OpenSSLSession
     /** Server-suggested ticket lifetime in seconds, or null if no ticket */
     public function getTicketLifetimeHint(): ?int {}
 
-    /** @internal Serializes to PEM for use with serialize()/unserialize() */
+    /**
+     * @internal Serializes to PEM for use with serialize().
+     * @throws OpenSSLException on serialization failure
+     */
     public function __serialize(): array {}
 
-    /** @internal Restores from PEM data */
+    /**
+     * @internal Restores from PEM data.
+     * @throws OpenSSLException on unserialization failure
+     */
     public function __unserialize(array $data): void {}
 }
 </PHP>
@@ -197,10 +230,10 @@ This proposal adds the following SSL stream context options:
 
 When a client stream is created:
 
-  1. If ''session_data'' is provided as an ''OpenSSLSession'' instance, attempt to resume with that session
-  2. If ''session_new_cb'' is provided, call it with the stream and an ''OpenSSLSession'' object when a new session is established or a new session ticket is received
-  3. If ''session_stream'' is provided (existing option), the SSL context and session are copied from the provided stream
-  4. When ''session_new_cb'' or ''session_data'' is set, client-side external cache mode is enabled (''SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_NO_INTERNAL'')
+  - If ''session_data'' is provided as an ''OpenSSLSession'' instance, attempt to resume with that session
+  - If ''session_new_cb'' is provided, call it with the stream and an ''OpenSSLSession'' object when a new session is established or a new session ticket is received
+  - If ''session_stream'' is provided (existing option), the SSL context and session are copied from the provided stream
+  - When ''session_new_cb'' or ''session_data'' is set, client-side external cache mode is enabled (''SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_NO_INTERNAL'')
 
 **Note:** Client-side session resumption requires either explicit management via ''session_data'' and ''session_new_cb'' or setting ''session_stream'' which copies the session from the provided stream.
 
@@ -235,6 +268,10 @@ The following validation errors are raised:
   * ''ValueError'' if ''session_id_context'' is missing when required
   * ''ValueError'' if ''session_cache_size'' or ''session_timeout'' is not positive
   * ''ValueError'' if ''no_ticket'' is set to false when ''session_get_cb'' is set
+  * ''OpenSSLException'' if ''OpenSSLSession::import()'' fails to decode or parse the provided data
+  * ''OpenSSLException'' if ''OpenSSLSession::export()'' fails to encode the session (DER or PEM) or fails to allocate internal resources
+  * ''OpenSSLException'' if ''OpenSSLSession::__serialize()'' fails to encode the session
+  * ''OpenSSLException'' if ''OpenSSLSession::__unserialize()'' receives invalid data or fails to restore the session
   * ''E_WARNING'' if callbacks are used with persistent streams (not supported)
   * ''E_WARNING'' if ''session_data'' contains an ''OpenSSLSession'' with an invalid or expired session (falls back to full handshake)
 
@@ -288,8 +325,13 @@ $sessionFile = '/tmp/tls_session_api.pem';
 
 $previousSession = null;
 if (file_exists($sessionFile)) {
-    $previousSession = OpenSSLSession::import(file_get_contents($sessionFile));
-    if (!$previousSession->isResumable()) {
+    try {
+        $previousSession = OpenSSLSession::import(file_get_contents($sessionFile));
+        if (!$previousSession->isResumable()) {
+            $previousSession = null;
+        }
+    } catch (OpenSSLException $e) {
+        // Corrupted or invalid session data, start fresh
         $previousSession = null;
     }
 }
@@ -385,7 +427,14 @@ $context = stream_context_create([
         'session_get_cb' => function($stream, string $id) use ($redis): ?OpenSSLSession {
             $key = 'tls_session:' . bin2hex($id);
             $result = $redis->get($key);
-            return $result !== false ? OpenSSLSession::import($result) : null;
+            if ($result === false) {
+                return null;
+            }
+            try {
+                return OpenSSLSession::import($result);
+            } catch (OpenSSLException $e) {
+                return null;
+            }
         },
 
         'session_remove_cb' => function($stream, string $id) use ($redis): void {
@@ -435,7 +484,7 @@ When session is enabled there are some differences in behaviour that is good to 
 
 ===== Backward Incompatible Changes =====
 
-This RFC introduces **no backward incompatible changes** 
+This RFC introduces **no backward incompatible changes**
 
 ===== Proposed PHP Version(s) =====
 Next PHP 8.5
@@ -477,12 +526,44 @@ This RFC lays the groundwork for future TLS 1.3 enhancements:
 These features are intentionally excluded from this RFC to maintain focus and allow for iterative development.
 
 ===== Voting Choices =====
+
+==== Primary Vote ====
+
 This is a simple yes/no vote requiring a 2/3 majority.
 
 <doodle title="Add TLS session resumption support to streams as described in this RFC?" voteType="single" closed="true">
    * Yes
    * No
    * Abstain
+</doodle>
+
+==== Secondary Vote: Exception Class Naming ====
+
+This RFC introduces an extension-specific exception class following the
+[[https://github.com/php/policies/blob/main/coding-standards-and-naming.rst#throwables|Throwable policy]].
+The primary proposal uses ''OpenSSLException'' for consistency with existing non-namespaced OpenSSL
+symbols (''OpenSSLCertificate'', ''OpenSSLCertificateSigningRequest'', ''OpenSSLAsymmetricKey'').
+However, the community may prefer a namespaced approach. This vote determines the final naming.
+
+Simple majority vote, only counted if the primary vote passes.
+
+<doodle title="What should the exception class be named?" voteType="single" closed="true">
+   * OpenSSLException (consistent with existing OpenSSL classes)
+   * Openssl\OpensslException (namespaced per Throwable policy recommendation)
+</doodle>
+
+==== Secondary Vote: Session Class Naming ====
+
+The primary proposal uses ''OpenSSLSession'' for consistency with existing non-namespaced OpenSSL
+symbols. However, as a new class with a proper method-based API (unlike the existing opaque resource
+wrappers), it could be placed in the ''Openssl'' namespace following latest naming conventions.
+This vote determines the final naming.
+
+Simple majority vote, only counted if the primary vote passes.
+
+<doodle title="What should the session class be named?" voteType="single" closed="true">
+   * OpenSSLSession (consistent with existing OpenSSL classes)
+   * Openssl\Session (namespaced per latest naming conventions)
 </doodle>
 
 ===== Patches and Tests =====
@@ -500,7 +581,10 @@ After the project is implemented, this section should contain:
   * [[https://www.rfc-editor.org/rfc/rfc5246.html#section-7.3|TLS 1.2 Session Resumption (RFC 5246)]]
   * [[https://www.openssl.org/docs/man3.0/man3/SSL_CTX_sess_set_new_cb.html|OpenSSL Session Callbacks Documentation]]
   * [[https://www.openssl.org/docs/man3.0/man3/SSL_set_session.html|OpenSSL Session Management API]]
+  * [[https://github.com/php/policies/blob/main/coding-standards-and-naming.rst#throwables|PHP Throwable Policy]]
 
 ===== Changelog =====
+  * 0.3 2026-03-04: Introduced OpenSSLException class, added secondary votes for exception and session class naming
   * 0.2 2026-02-13: Updated callback signatures to use OpenSSLSession, session_data and session_get_cb accept only OpenSSLSession and other changes
   * 0.1 2025-12-22: Initial RFC published
+  
