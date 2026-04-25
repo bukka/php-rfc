@@ -1,5 +1,5 @@
 ====== PHP RFC: Stream Error Handling Improvements ======
-  * Version: 2.2
+  * Version: 2.3
   * Date: 2025-11-18
   * Author: Jakub Zelenka, bukka@php.net
   * Status: Under Discussion
@@ -101,15 +101,12 @@ are reported according to the context's error handling configuration.
 <?php
 
 /**
- * Categorized error codes for stream operations
+ * Error codes for stream operations
  */
 enum StreamErrorCode
 {
-    // General errors
     case None;
     case Generic;
-    
-    // I/O operation errors
     case ReadFailed;
     case WriteFailed;
     case SeekFailed;
@@ -121,8 +118,6 @@ enum StreamErrorCode
     case ListenFailed;
     case NotWritable;
     case NotReadable;
-    
-    // File system operation errors
     case Disabled;
     case NotFound;
     case PermissionDenied;
@@ -147,8 +142,6 @@ enum StreamErrorCode
     case ModeNotSupported;
     case Readonly;
     case RecursionDetected;
-    
-    // Wrapper/protocol errors
     case NotImplemented;
     case NoOpener;
     case PersistentNotSupported;
@@ -158,18 +151,12 @@ enum StreamErrorCode
     case WrapperRegistrationFailed;
     case WrapperUnregistrationFailed;
     case WrapperRestorationFailed;
-    
-    // Filter errors
     case FilterNotFound;
     case FilterFailed;
-    
-    // Cast/conversion errors
     case CastFailed;
     case CastNotSupported;
     case MakeSeekableFailed;
     case BufferedDataLost;
-    
-    // Network/socket errors
     case NetworkSendFailed;
     case NetworkRecvFailed;
     case SslNotSupported;
@@ -183,36 +170,17 @@ enum StreamErrorCode
     case InvalidParam;
     case RedirectLimit;
     case AuthFailed;
-    
-    // Encoding/decoding errors
     case ArchivingFailed;
     case EncodingFailed;
     case DecodingFailed;
     case InvalidFormat;
-    
-    // Resource/allocation errors
     case AllocationFailed;
     case TemporaryFileFailed;
-    
-    // Locking errors
     case LockFailed;
     case LockNotSupported;
-    
-    // Userspace stream errors
     case UserspaceNotImplemented;
     case UserspaceInvalidReturn;
     case UserspaceCallFailed;
-    
-    public function isIoError(): bool {}
-    public function isFileSystemError(): bool {}
-    public function isWrapperError(): bool {}
-    public function isFilterError(): bool {}
-    public function isCastError(): bool {}
-    public function isNetworkError(): bool {}
-    public function isEncodingError(): bool {}
-    public function isResourceError(): bool {}
-    public function isLockError(): bool {}
-    public function isUserspaceError(): bool {}
 }
 
 ?>
@@ -407,26 +375,6 @@ function stream_clear_errors(): void {}
 ?>
 </code>
 
-==== Error Codes ====
-
-Error codes are defined as cases on the ''StreamErrorCode'' enum. They are organized into groups by category:
-
-^ Group                         ^ Example Cases                                                   ^
-| General                       | ''None'', ''Generic''                                           |
-| I/O operations                | ''ReadFailed'', ''WriteFailed''                                 |
-| File system operations        | ''NotFound'', ''PermissionDenied''                               |
-| Wrapper/protocol operations   | ''NotImplemented'', ''WrapperNotFound''                          |
-| Filter operations             | ''FilterNotFound'', ''FilterFailed''                             |
-| Cast/conversion operations    | ''CastFailed'', ''CastNotSupported''                             |
-| Network/socket operations     | ''NetworkSendFailed'', ''ProtocolError''                         |
-| Encoding/decoding operations  | ''EncodingFailed'', ''DecodingFailed''                           |
-| Resource/allocation operations| ''AllocationFailed'', ''TemporaryFileFailed''                    |
-| Locking operations            | ''LockFailed'', ''LockNotSupported''                             |
-| Userspace stream operations   | ''UserspaceNotImplemented''                                      |
-
-The ''is*Error()'' convenience methods on ''StreamErrorCode'' check whether the case falls within the corresponding
-group.
-
 ==== Error Grouping ====
 
 When a stream operation involves multiple sub-operations (e.g., ''stream_select()'' calling ''stream_cast()'' which may
@@ -455,22 +403,17 @@ foreach ($errors as $error) {
 $totalErrors = count($errors);
 
 // Get the primary error
-$primary = $errors[0] ?? null;
+$primary = array_first($errors);
 
-// Search for specific codes using array_any (PHP 8.5+)
+// Search for specific codes
 if (array_any($errors, fn($e) => $e->code === StreamErrorCode::NotImplemented)) {
     echo "Stream does not implement required functionality\n";
 }
 
-// Find a specific error using array_find (PHP 8.5+)
+// Find a specific error
 $notImpl = array_find($errors, fn($e) => $e->code === StreamErrorCode::NotImplemented);
 if ($notImpl) {
     echo "Not implemented: " . $notImpl->message . "\n";
-}
-
-// Check error categories
-if (array_any($errors, fn($e) => $e->code->isNetworkError())) {
-    echo "Network-related error occurred\n";
 }
 
 ?>
@@ -496,7 +439,7 @@ try {
     echo "Code: " . $e->getCode() . "\n";
     
     $errors = $e->getErrors();
-    $first = $errors[0] ?? null;
+    $first = array_first($errors);
     if ($first) {
         echo "Wrapper: " . $first->wrapperName . "\n";
         echo "Error Code: " . $first->code->name . "\n";
@@ -525,18 +468,13 @@ $stream = @fopen('http://example.com/nonexistent', 'r', false, $context);
 
 if ($stream === false) {
     $errors = stream_last_errors();
-    $first = $errors[0] ?? null;
+    $first = array_first($errors);
     
     if ($first) {
         echo "Error: {$first->code->name}: {$first->message}\n";
         
         if ($first->code === StreamErrorCode::NotFound) {
             echo "Resource not found, using fallback...\n";
-        }
-        
-        // Check error category
-        if ($first->code->isNetworkError()) {
-            echo "Network-related error occurred\n";
         }
     }
 }
@@ -638,11 +576,6 @@ try {
     stream_copy_to_stream($src, $dst, null, 0, $context);
 } catch (StreamException $e) {
     echo "Copy failed: " . $e->getMessage() . "\n";
-    
-    $errors = $e->getErrors();
-    if (array_any($errors, fn($e) => $e->code->isIoError())) {
-        echo "I/O error during copy\n";
-    }
 }
 
 ?>
@@ -669,7 +602,7 @@ PHP 8.6
 This proposal establishes a foundation for future enhancements:
 
   * **Additional error codes** - As new stream operations and wrappers are added
-  * **Extension-specific error ranges** - Reserved ranges for extensions to define custom error codes
+  * **Error code categories** - Convenience methods or interfaces for grouping related error codes
   * **Error metadata** - Additional context fields for specific error types
   * **Context parameter for more functions** - Additional stream functions may gain optional ''$context'' parameters to enable error handling configuration where currently not possible
 
@@ -707,7 +640,8 @@ After the project is implemented, this section will contain:
 
 ===== Changelog =====
 
-  * 2.2 - Replace ''StreamError'' class constants with ''StreamErrorCode'' enum, replace linked-list error chaining with arrays and related functions updates, added stream_clear_errors
+  * 2.3 - Remove error code categories and ''is*Error()'' methods from ''StreamErrorCode'' enum, defer to future scope
+  * 2.2 - Replace ''StreamError'' class constants with ''StreamErrorCode'' enum, replace linked-list error chaining with arrays and related functions updates, added ''stream_clear_errors()''
   * 2.1 - Replace ''StreamErrorCode'' enum with ''StreamError'' class constants (''CODE_*'' prefix), move ''is*Error()'' methods to ''StreamError'', prohibit error handling options on default context, add context parameter to some stream functions
   * 2.0 - Major API redesign with enums, error chaining, and simplified retrieval
   * 1.0 - Initial version
