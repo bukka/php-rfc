@@ -1,117 +1,121 @@
 ====== PHP RFC: IO Hooks and Operations ======
-  * Version: 0.1
+  * Version: 1.1
   * Date: 2026-09-29
   * Author: Jakub Zelenka, bukka@php.net
-  * Status: Draft
+  * Status: Under Discussion
   * First Published at: https://wiki.php.net/rfc/io_hooks
 
 
 ===== Introduction =====
 
 Every blocking function in PHP blocks the whole process. ''fread()'' on a socket waits for the peer,
-''stream_socket_client()'' waits for the connection, ''file_get_contents()'' waits for the disk, ''sleep()'' waits
-for the clock, ''curl_exec()'' waits for the server, and a name lookup waits for the resolver. While one of them
-waits, nothing else in the process runs.
+''stream_socket_client()'' waits for the connection, ''file_get_contents()'' waits for the disk, ''sleep()''
+waits for the clock, ''curl_exec()'' waits for the server, and a name lookup waits for the resolver. While one
+of them waits, nothing else in the process runs.
 
 Since PHP 8.1 the language has Fibers, so a program can hold many suspended flows at once and switch between
 them. What it cannot do is resume a Fiber when its IO is ready, because the IO functions never suspend. A
 Fiber that calls ''fread()'' blocks the process like any other code. Frameworks that offer concurrency today
-(AMPHP, ReactPHP, Revolt) work around this by reimplementing IO in PHP: their own socket clients, HTTP clients,
-DNS resolvers and file IO, all non-blocking, all separate from the standard library. Anything built on the
-standard library, from a database driver to an SDK using ''curl'', stays blocking inside them.
+(AMPHP, ReactPHP, Revolt) work around this by reimplementing IO in PHP: their own socket clients, HTTP
+clients, DNS resolvers and file IO, all non-blocking, all separate from the standard library. Anything built
+on the standard library, from a database driver to an SDK using ''curl'', stays blocking inside them.
 
 ==== What this RFC proposes ====
 
 This RFC adds one integration point in the engine through which the blocking waits and IO operations of the
 stream layer and the extensions built on it (sockets, curl, OpenSSL, the sleep functions, name lookups and
-process waits) are handed to a **provider** installed for the current request. A provider is typically an event loop
-or a Fiber scheduler. It receives a description of the operation, submits it to whatever it waits on,
-suspends the calling Fiber, and returns the outcome when the operation completed. The calling code, an
+process waits) are handed to a **provider** installed for the current request. A provider is typically an
+event loop or a Fiber scheduler. It receives a description of the operation, submits it to whatever it waits
+on, suspends the calling Fiber, and returns the outcome when the operation completed. The calling code, an
 ordinary ''fread()'' in an ordinary PHP function, sees the bytes as it always did.
 
-With a provider installed, existing blocking code becomes concurrent without being rewritten. Two Fibers
-that each call ''file_get_contents('http://...')'' run their transfers at the same time, a database query in
-one Fiber lets another Fiber serve a request meanwhile, and ''sleep(1)'' in one Fiber is a second of work for
-the others. With no provider installed PHP behaves exactly as today, and nothing is installed unless a script
-or an extension does it.
+With a provider installed, existing blocking code becomes concurrent without being rewritten. Two Fibers that
+each call ''file_get_contents('http://...')'' run their transfers at the same time, a database query in one
+Fiber lets another Fiber serve a request meanwhile, and ''sleep(1)'' in one Fiber is a second of work for the
+others. With no provider installed PHP behaves exactly as today, and nothing is installed unless a script or
+an extension does it.
 
 The idea is the one Go's runtime applies to its standard library. The blocking call is the API, and what
 happens while it waits is the runtime's business. The difference is that PHP has no built-in scheduler and
-this RFC does not add one. It defines the integration point and no policy. Which flow runs while another
-waits is entirely the provider's decision, and a provider can be written in PHP on top of Fibers.
+this RFC does not add one. It defines the integration point and no policy. Which flow runs while another waits
+is entirely the provider's decision, and a provider can be written in PHP on top of Fibers.
 
 ==== Relation to other work ====
 
-The RFC builds on the Poll API from PHP 8.6 and requires the [[rfc:poll_api_additions|Polling API
-additions]], which provide the handle types that operations carry.
+The RFC builds on the Poll API from PHP 8.6 and requires the [[rfc:poll_api_additions|Polling API additions]],
+which provide the handle types that operations carry.
 
 The async core RFC (TrueAsync) proposes a scheduler API in Zend. It is IO agnostic and lists a non-blocking IO
-layer for the engine's blocking functions as follow-up work. This RFC is that layer, and a C scheduler becomes a
-provider of the hooks. The two do not depend on each other.
+layer for the engine's blocking functions as follow-up work. This RFC is that layer, and a C scheduler becomes
+a provider of the hooks. The two do not depend on each other.
 
-A companion RFC, the Ring, adds a second executor for operations, built on io_uring on Linux, IOCP on Windows
-and a thread pool elsewhere, through a library bundled with PHP. It is what makes file reads and name lookups
-suspend, where the executor in this RFC can only wait for readiness of sockets and pipes. It is a separate RFC
-to keep this one readable and because it is independent, since everything here works without it.
+A companion RFC, the [[rfc:io_ring|Ring API]], adds a second executor for operations, built on io_uring on
+Linux, IOCP on Windows and a thread pool elsewhere, through a library bundled with PHP. It is what makes file
+reads and name lookups suspend, where the executor in this RFC can only wait for readiness of sockets and
+pipes. It is a separate RFC to keep this one readable and because everything here works without it. The Ring
+RFC is still a draft. It depends heavily on this one, since its engine is an operation queue as defined here,
+and it is linked so that the two can be read together.
 
 ===== Terminology =====
 
 The RFC uses a handful of terms throughout. They are defined here so that the rest can be read without prior
 knowledge of event loops or asynchronous IO.
 
-**Blocking.** A function blocks when it does not return until something outside the program happens, for example data
-arrives on a socket, a timer expires, a child process exits. While it blocks, the process does nothing else.
+**Blocking.** A function blocks when it does not return until something outside the program happens, for
+example data arrives on a socket, a timer expires, a child process exits. While it blocks, the process does
+nothing else.
 
 **Descriptor.** The operating system's handle for an open file, socket or pipe, a small number on POSIX
 systems, a handle on Windows. Every stream and ''Socket'' object in PHP wraps one. A descriptor is
 **non-blocking** when a read or write on it returns at once with a "would block" error instead of waiting.
 
 **Readiness.** The state of a descriptor that would let an operation proceed without blocking. A socket with
-data to read is ready for reading, one with room in its send buffer is ready for writing. The operating
-system can report readiness for many descriptors at once (''select'', ''poll'', epoll, kqueue), which is what
-the Poll API exposes. Regular files are always "ready" and always block, so readiness says nothing useful
-about them.
+data to read is ready for reading, one with room in its send buffer is ready for writing. The operating system
+can report readiness for many descriptors at once (''select'', ''poll'', epoll, kqueue), which is what the
+Poll API exposes. Regular files are always "ready" and always block, so readiness says nothing useful about
+them.
 
-**Fiber.** A PHP construct (since 8.1) that runs a function on its own stack so that it can be suspended
-in the middle and resumed later, from any depth of function calls. Suspending a Fiber hands control back to
+**Fiber.** A PHP construct (since 8.1) that runs a function on its own stack so that it can be suspended in
+the middle and resumed later, from any depth of function calls. Suspending a Fiber hands control back to
 whoever resumed it. Nothing runs concurrently, the Fibers take turns.
 
-**Provider.** The object that the engine hands blocking operations to, installed for the current request.
-It is typically an event loop or a Fiber scheduler, a piece of code that owns the main flow of the program,
-runs Fibers, and decides which one to resume next. Frameworks such as AMPHP, ReactPHP and Revolt contain
-one. A provider implements the ''Io\Hooks\Hooks'' interface.
+**Provider.** The object that the engine hands blocking operations to, installed for the current request. It
+is typically an event loop or a Fiber scheduler, a piece of code that owns the main flow of the program, runs
+Fibers, and decides which one to resume next. Frameworks such as AMPHP, ReactPHP and Revolt contain one. A
+provider implements the ''Io\Hooks\Hooks'' interface.
 
-**Operation.** A description of one blocking action the engine wants performed, such as "receive up to 8192 bytes
-from this socket, within two seconds", "wait until this socket is readable", "sleep until this deadline",
-"resolve this host name". An operation is an ''Io\Operation'' object of a subclass that says which action.
-It is created by the engine, handed to the provider, and is over once the provider returned its outcome.
+**Operation.** A description of one blocking action the engine wants performed, such as "receive up to 8192
+bytes from this socket, within two seconds", "wait until this socket is readable", "sleep until this
+deadline", "resolve this host name". An operation is an ''Io\Operation'' object of a subclass that says which
+action. It is created by the engine, handed to the provider, and is over once the provider returned its
+outcome.
 
 **Completion.** The outcome of an operation, a status such as done, ready or timed out, and the result, for
 example how many bytes were received. An ''Io\Completion'' object.
 
-**Operation queue.** The thing a provider hands operations to and waits on. It performs or observes
-operations in the background and reports their completions when the provider asks. Two are in this RFC:
-one built on the Poll API, which can only tell when descriptors are ready, and one in the companion Ring
-RFC, which performs the operations itself. An ''Io\OperationQueue'' object.
+**Operation queue.** The thing a provider hands operations to and waits on. It performs or observes operations
+in the background and reports their completions when the provider asks. Two are in this RFC: one built on the
+Poll API, which can only tell when descriptors are ready, and one in the companion [[rfc:io_ring|Ring RFC]],
+which performs the operations itself. An ''Io\OperationQueue'' object.
 
 **Readiness executor and completion executor.** A queue, or a provider, that can only report readiness is a
 readiness executor, and the engine then performs the operation once told it can proceed. One that performs the
-operation itself is a completion executor. The first covers sockets and pipes. Only the second can take a
-file read or a name lookup off the calling thread.
+operation itself is a completion executor. The first covers sockets and pipes. Only the second can take a file
+read or a name lookup off the calling thread.
 
-**Handle.** The Poll API's object for something that can be waited on, such as a stream, a ''Socket'', a timer, a
-signal, a process. Every operation on a descriptor carries the handle of its resource. The handle is the
-same object for as long as the resource is open, so a provider can use it as a key for state it keeps per
+**Handle.** The Poll API's object for something that can be waited on, such as a stream, a ''Socket'', a
+timer, a signal, a process. Every operation on a descriptor carries the handle of its resource. The handle is
+the same object for as long as the resource is open, so a provider can use it as a key for state it keeps per
 connection. Handles carried by operations are **weak**: they do not keep the resource alive.
 
-**Registration.** A note from the engine to the provider that it will wait on the same descriptor for the
-same thing repeatedly, for example on a socket for readability in a read loop, until the descriptor closes.
-It lets the provider set that wait up once and keep it instead of building it from scratch for every
-operation. It is an optimisation the provider may ignore. An ''Io\Registration'' object.
+**Registration.** A note from the engine to the provider that it will wait on the same descriptor for the same
+thing repeatedly, for example on a socket for readability in a read loop, until the descriptor closes. It lets
+the provider set that wait up once and keep it instead of building it from scratch for every operation. It is
+an optimisation the provider may ignore. An ''Io\Registration'' object.
 
-**Trigger.** How a registration's waits may be answered. **Edge** means the provider may answer a wait from
-a readiness it noticed earlier, because the engine promises to have drained the descriptor before waiting
-again. **Level** means readiness must be checked afresh each time.
+**Trigger.** How a registration's waits may be answered. **Edge** means the provider may answer a wait from a
+readiness it noticed earlier, because the engine promises to have drained the descriptor before waiting again.
+**Level** means readiness must be checked afresh each time.
 
 **Capability.** Something a provider declares it can do beyond reporting readiness, such as performing file
 operations, so that the engine hands it the corresponding operations. A provider without capabilities is a
@@ -134,12 +138,13 @@ the thing it waits on, and suspends the Fiber. Some other Fiber runs. When the q
 is readable, the provider resumes the Fiber with a **completion** saying ''Ready'', ''run()'' returns it, the
 stream layer calls ''recv()'' again and ''fread()'' returns the data.
 
-Every blocking point this RFC covers is expressed this way, and the section on changes in php-src lists
-them. What is not covered keeps blocking as today, which includes ''exec()'' and its siblings, ''flock()'' without ''LOCK_NB'',
-''sem_acquire()'', and extensions waiting on descriptors they own themselves, pgsql among them. Polling is one operation type among others, sleep is
-a ''Timer'' operation, and waiting on several descriptors at once, which ''stream_select()'' and ''curl_exec()''
-do, is an ''Any'' operation whose members are Poll and Timer operations. That is what lets one integration
-point serve two kinds of provider:
+Every blocking point this RFC covers is expressed this way, and the section on changes in php-src lists them.
+What is not covered keeps blocking as today, which includes ''mail()'' waiting for its child, ''flock()''
+without ''LOCK_NB'', ''sem_acquire()'', the ''dns_get_record()'' family, and extensions waiting on descriptors
+they own themselves, pgsql among them. Polling is one operation type among others, sleep is a ''Timer''
+operation, and waiting on several descriptors at once, which ''stream_select()'' and ''curl_exec()'' do, is an
+''Any'' operation whose members are Poll and Timer operations. That is what lets one integration point serve
+two kinds of provider:
 
   * A **readiness** provider, on the Poll API, can tell when a descriptor is ready but cannot perform the operation. It completes the operation as ''Ready'' and the core performs the syscall. Operations that have no readiness form, such as a regular file read or a name lookup, it completes as ''Unsupported'' and the core performs them synchronously, as today.
   * A **completion** provider, on the Ring, performs the operation itself, files and lookups included, and completes it as ''Done''.
@@ -147,7 +152,7 @@ point serve two kinds of provider:
 The RFC ships one executor, ''Io\Poll\OperationQueue'', which is a readiness executor built on an
 ''Io\Poll\Context''. A provider is then a small class. ''run()'' submits to the queue and suspends the Fiber,
 and its loop resumes each Fiber with the completion the queue reports. The complete class is under Usage
-Examples and is about fifty lines.
+Examples and is under a hundred lines.
 
 ==== Operations ====
 
@@ -167,11 +172,11 @@ the remaining time. A subclass adds what only its type has. Providers match on '
 | ''Any'' | ''curl_exec()'', ''stream_select()'', ''socket_select()'' | reports the members that are ready |
 
 Every operation on a descriptor also says which readiness events let it proceed (''Read'' for a ''Recv'' or an
-''Accept'', ''Write'' for a ''Send'' or a ''Connect''), which is what lets a readiness provider treat all of them
-the same way, by watching the handle for those events and completing as ''Ready''.
+''Accept'', ''Write'' for a ''Send'' or a ''Connect''), which is what lets a readiness provider treat all of
+them the same way, by watching the handle for those events and completing as ''Ready''.
 
-A completion carries one of six statuses. ''Done'' means the operation was performed and the result (bytes,
-an accepted descriptor) is valid. ''Ready'' means the descriptor is ready and the core should perform the
+A completion carries one of six statuses. ''Done'' means the operation was performed and the result (bytes, an
+accepted descriptor) is valid. ''Ready'' means the descriptor is ready and the core should perform the
 operation. ''Timeout'' means the deadline passed. ''Unsupported'' means the provider can neither perform the
 operation nor observe readiness for it, and the core does it synchronously. ''Cancelled'' means the provider
 gave up on the operation and an exception is pending. ''Interrupted'' means a signal ended the wait, which
@@ -180,80 +185,114 @@ only happens without a provider.
 ==== Providers and capabilities ====
 
 A provider reports, once, when it is installed, what it can do beyond waiting for readiness. Without any
-capability the provider is readiness based. The core tries the syscall first, hands descriptor operations
-over only when they would block, and never hands over file operations. That default is deliberate, because
+capability the provider is readiness based. The core tries the syscall first, hands descriptor operations over
+only when they would block, and never hands over file operations. That default is deliberate, because
 measurements showed that handing everything to the provider loses whenever the data is usually there. A read
 that finds data costs one syscall, while a round trip through a provider written in PHP costs far more.
 
-The capabilities are for providers that can do more, in practice ones built on a completion queue.
-''Files'' sends regular file reads, writes and ''fsync()'' to the provider, which performs them. ''DirectData''
-sends data operations to the provider before the core tries the syscall, which fits a provider that performs
-them inline in the kernel. ''DirectAccept'' does the same for accepts. ''EdgeRegistrations'' and
-''LevelRegistrations'' say that the provider wants to be told about descriptors it will be asked to wait on
-repeatedly, so it can set them up once (see Registrations). A provider built on a queue simply reports what
-the queue tells it to.
+The capabilities are for providers that can do more, in practice ones built on a completion queue. ''Files''
+sends regular file reads, writes and ''fsync()'' to the provider, which performs them. ''DirectData'' sends
+data operations to the provider before the core tries the syscall, which fits a provider that performs them
+inline in the kernel. ''DirectAccept'' does the same for accepts. The three are served by the Ring. A provider
+on ''Io\Poll\OperationQueue'' has no use for them, since that queue answers readiness only, and a provider
+that does not declare them never sees a direct operation. ''EdgeRegistrations'' and ''LevelRegistrations'' say
+that the provider wants to be told about descriptors it will be asked to wait on repeatedly, so it can set
+them up once (see Registrations). A provider built on a queue simply reports what the queue tells it to.
 
 ==== One provider per request ====
 
 ''run()'' owns the current flow. It decides what the flow waits on and when it resumes. That cannot be shared
-between two implementations, so there is exactly one provider per request and no chain. ''Io\Hooks\set_hooks()''
-installs a provider and returns the previous one, following ''set_error_handler()''. A provider that wants to
-handle only some operations keeps the previous one and forwards the rest to it explicitly. Passing null
-uninstalls. A scheduler written in C installs its provider before any script code runs, and ''set_hooks()''
-throws while one is installed. Hooks are cleared at request shutdown.
+between two implementations, so there is exactly one provider per request and no chain.
+''Io\Hooks\set_hooks()'' installs a provider and returns the previous one, following ''set_error_handler()''.
+A provider that wants to handle only some operations keeps the previous one and forwards the rest to it
+explicitly. Passing null uninstalls. A scheduler written in C installs its provider before any script code
+runs, and ''set_hooks()'' throws while one is installed. Hooks are cleared at request shutdown.
+
+==== Operations outside a Fiber ====
+
+''run()'' is called wherever a blocking function runs, which includes the main flow of the script outside any
+Fiber. A top-level ''sleep()'' or a write to standard output on a pipe reaches the provider too, and there is
+nothing to suspend there. ''Fiber::suspend()'' throws a ''FiberError'' outside a Fiber, so a provider has to
+handle the case. The usual answer is to run its loop inline until that one operation completes, with the other
+Fibers progressing meanwhile, which is what the example provider does.
 
 ==== Waiting on several things at once ====
 
 ''stream_select()'', ''socket_select()'' and the ''curl_exec()'' loop wait on many descriptors plus a timeout.
-Rather than a second hook method, that is the ''Any'' operation. Its members are Poll and Timer operations,
-it completes once at least one member completed, and its completion lists every member that had completed by
+Rather than a second hook method, that is the ''Any'' operation. Its members are Poll and Timer operations, it
+completes once at least one member completed, and its completion lists every member that had completed by
 then. A provider on a queue submits it like any other operation and gets one completion back, and the queue
-withdraws the members that did not fire. Data operations are never members, since a read that completed
-inside an Any and was not reported would lose bytes.
+withdraws the members that did not fire. Data operations are never members, since a read that completed inside
+an Any and was not reported would lose bytes.
 
 ==== Registrations ====
 
-Operations are one-shot, but waits on one descriptor repeat. A read loop waits on its socket after every
-short read, an accept loop on its listener. Setting each wait up from nothing costs a registration and a
-removal in the kernel per wait on epoll, and a watcher allocation per wait in a userland provider. A
-registration tells the provider that waits on a (handle, event) pair will repeat until the pair is removed,
-so it can set the pair up once and keep it. The core registers a stream's read and write pairs at the first
-wait on each and removes them before the descriptor closes. The provider receives the same ''Io\Registration''
-object in ''add()'', in ''remove()'' and from every operation on the pair, so it can key its state on it.
+Operations are one-shot, but waits on one descriptor repeat. A read loop waits on its socket after every short
+read, an accept loop on its listener. Setting each wait up from nothing costs a registration and a removal in
+the kernel per wait on epoll, and a watcher allocation per wait in a userland provider. A registration tells
+the provider that waits on a (handle, event) pair will repeat until the pair is removed, so it can set the
+pair up once and keep it. The core registers a stream's read and write pairs at the first wait on each and
+removes them before the descriptor closes. The provider receives the same ''Io\Registration'' object in
+''add()'', in ''remove()'' and from every operation on the pair, so it can key its state on it.
 
 A registration carries a trigger. ''Edge'' means every wait on the pair follows a read that returned nothing,
 so a provider may keep the pair armed edge-triggered and answer a wait from readiness it recorded meanwhile.
 ''Level'' means readiness must be current when the wait is armed, which is what libcurl's uploads need. A
-registration is a permission, never an obligation. A provider that reports no registration capability is
-never called and serves every wait one-shot, which is correct and merely slower.
+registration is a permission, never an obligation. A provider that reports no registration capability is never
+called and serves every wait one-shot, which is correct and merely slower.
 
 ==== Streams are frozen during an operation ====
 
 While an operation on a stream is in flight, the stream is frozen. Any use of it from another Fiber,
-''fclose()'' included, throws an ''Error'' ("Concurrent access to a stream") instead of touching it. This is not
-only a guard against a programming error. With a completion provider the stream's read buffer belongs to the
-kernel or a worker thread until the operation completes, so freeing the stream earlier would corrupt memory.
-The same applies to a ''CurlHandle'' while ''curl_exec()'' is suspended and to a ''Socket'' object while an
-operation on it is in flight.
+''fclose()'' included, throws an ''Error'' ("Concurrent access to a stream") instead of touching it. This is
+not only a guard against a programming error. With a completion provider the stream's read buffer belongs to
+the kernel or a worker thread until the operation completes, so freeing the stream earlier would corrupt
+memory. The same applies to a ''CurlHandle'' while ''curl_exec()'' is suspended, to a ''Socket'' object while
+an operation on it is in flight, and to a ''HashContext'' while ''hash_update_stream()'' or
+''hash_update_file()'' reads.
 
 A Fiber that is destroyed while suspended in an operation, or that unwinds through an exception, does not
 leave the stream in an undefined state. The queue keeps the operation alive until the backend is done with it
 and finishes it silently, and the stream stays frozen until then.
 
+==== Suspension safety ====
+
+Every hooked call is a suspension point inside C code that was written without one. The freeze is the general
+guard. Whatever holds the operation, the stream, the ''Socket'', the curl handle, cannot be touched or freed
+by another Fiber until the operation is over, and that covers every consumer that reads or writes through the
+stream layer. What the freeze does not cover is state an extension keeps above a stream and frees itself, such
+as a parser holding the stream it reads. Those consumers carry a guard of their own. XMLReader and XMLWriter
+refuse to be freed, reset or re-entered while a read or write is suspended, a ''HashContext'' is busy for the
+duration of a stream update, and the mysqli entry points that run a query refuse to free the result or the
+connection under it. The rule for extension authors is the same. An extension that owns something above a
+stream and may free it from PHP code needs a busy flag around its stream calls, and one that lacks it is
+affected only when an application installs a provider.
+
+The opposite default was considered, hooked calls running synchronously unless the call site declares itself
+suspension safe. It would leave nearly every blocking builtin outside the hooks, which is the problem this RFC
+exists to solve, so the default is the freeze plus a guard per consumer that needs one.
+
 ==== Lifetime of operations ====
 
 An ''Io\Operation'' is valid until ''run()'' returns for it. After that ''isValid()'' is false, every other
 method throws ''Io\InvalidOperationException'', and a queue refuses it, so a stale object kept in a provider's
-array can do no harm. An ''Io\Completion'' carries its result by value and stays usable while it is referenced.
-A handle is the same object for the same descriptor while the descriptor is open, so a provider can key a
-''WeakMap'' on it. The operation objects are created only when a userland provider is installed. A provider
-written in C works on C structures and nothing is allocated per operation.
+array can do no harm. An ''Io\Completion'' carries its result by value and stays usable while it is
+referenced. A handle is the same object for the same descriptor while the descriptor is open, so a provider
+can key a ''WeakMap'' on it. The operation objects are created only when a userland provider is installed. A
+provider written in C works on C structures and nothing is allocated per operation.
+
+A weak stream handle an operation carries may belong to a stream the script never saw, such as the socket
+inside the http wrapper or a mysqlnd connection. ''StreamPollWeakHandle::isExposed()'' is false for those and
+''getStream()'' returns null, since handing the stream out would create a resource for something that was
+never meant to be seen. ''getStream()'' also returns null while the stream is frozen by an operation. Both are
+additions to the Poll API's weak handle that only this RFC makes observable, which is why they are specified
+here.
 
 ==== Cancellation ====
 
 Cancellation is initiated by the provider, typically a scheduler cancelling a Fiber. A userland provider
-throws from ''run()'': the exception surfaces from the blocking PHP function (''fread()'' returns false with the
-exception pending). Before throwing, the provider must have cancelled the operation on its queue, so that
+throws from ''run()'': the exception surfaces from the blocking PHP function (''fread()'' returns false with
+the exception pending). Before throwing, the provider must have cancelled the operation on its queue, so that
 nothing still references the stream's buffer. Timeouts never involve cancellation. They are the operation's
 deadline, enforced by the queue.
 
@@ -267,15 +306,17 @@ Fiber, which is how event loops treat signals.
 
 ==== What is not hooked ====
 
-''Io\Poll\Context::wait()'' and the queues' ''waitCompletions()'' block and do not go through the hooks. They are
-what a provider blocks in, so routing them through the provider would recurse into its own wait. User stream
-wrappers are not affected either. Their methods are PHP code and suspend only if they themselves call a
-hooked function.
+''Io\Poll\Context::wait()'' and the queues' ''waitCompletions()'' block and do not go through the hooks. They
+are what a provider blocks in, so routing them through the provider would recurse into its own wait. User
+stream wrappers are not affected either. Their methods are PHP code and suspend only if they themselves call a
+hooked function. The file an ''include'' compiles from is read synchronously even under a ''Files'' provider,
+since a suspension inside the compiler would let other code run while a script is half declared.
 
 ===== API =====
 
-All classes are final with private constructors unless stated otherwise, not serializable, with strict
-properties. The core creates operations, completions and registrations, and buffers are never exposed.
+All classes are final with private constructors unless stated otherwise. None of them is serializable or
+accepts dynamic properties, and the stubs are marked accordingly. The core creates operations, completions and
+registrations, and buffers are never exposed.
 
 ==== Operations and completions ====
 
@@ -296,7 +337,7 @@ enum CompletionStatus
 
 /**
  * One blocking action the core handed to the provider. The subclasses in
- * Io\Operation say which; providers match on instanceof.
+ * Io\Operation say which, and providers match on instanceof.
  */
 abstract class Operation
 {
@@ -305,20 +346,20 @@ abstract class Operation
     /**
      * The handle of the resource: a WeakHandle for descriptor based
      * operations, a TimerHandle, ProcessHandle or SignalHandle for Timer,
-     * WaitPid and SigWait; null for name lookups and Any.
+     * WaitPid and SigWait, and null for name lookups and Any.
      */
     public function getHandle(): ?Poll\Handle {}
 
-    /** The registration of the pair a wait is on; null when the pair is not registered. */
+    /** The registration of the pair a wait is on, or null when the pair is not registered. */
     public function getRegistration(): ?Registration {}
 
     /**
-     * The events that let the operation proceed; empty when there is no handle.
+     * The events that let the operation proceed, empty when there is no handle.
      * @return list<Poll\Event>
      */
     public function getEvents(): array {}
 
-    /** The remaining time; null when there is no deadline. */
+    /** The remaining time, or null when there is no deadline. */
     public function getTimeout(): ?\Time\Duration {}
 
     /** False once the operation ended. */
@@ -355,7 +396,7 @@ final class Completion
     /** The $data passed to OperationQueue::submit(). */
     public function getData(): mixed {}
 
-    /** @return list<Completion> members of an Any that had completed; empty otherwise */
+    /** @return list<Completion> members of an Any that had completed, empty otherwise */
     public function getCompletions(): array {}
 }
 
@@ -371,10 +412,10 @@ namespace Io\Operation;
 
 use Io\Operation;
 
-/** A readiness wait; getEvents() is the requested set. */
+/** A readiness wait. getEvents() is the requested set. */
 final class Poll extends Operation {}
 
-/** A wait until the deadline; the handle is a Poll\TimerHandle. */
+/** A wait until the deadline. The handle is a Poll\TimerHandle. */
 final class Timer extends Operation {}
 
 final class Read extends Operation
@@ -416,21 +457,21 @@ final class Fsync extends Operation
     public function isDataOnly(): bool {}
 }
 
-/** A wait for a child; the handle is a Poll\ProcessHandle for one pid, null for any child. */
+/** A wait for a child. The handle is a Poll\ProcessHandle for one pid and null for any child. */
 final class WaitPid extends Operation
 {
     /** The pid, or -1 for any child */
     public function getPid(): int {}
 }
 
-/** A wait for one of a set of signals; the handle is a Poll\SignalHandle over the set. */
+/** A wait for one of a set of signals. The handle is a Poll\SignalHandle over the set. */
 final class SigWait extends Operation
 {
     /** @return list<int> */
     public function getSignals(): array {}
 }
 
-/** A host name lookup; no handle. */
+/** A host name lookup, without a handle. */
 final class GetAddrInfo extends Operation
 {
     public function getHost(): string {}
@@ -443,14 +484,14 @@ final class GetAddrInfo extends Operation
     public function completeWithAddresses(array $addresses): \Io\Completion {}
 }
 
-/** A reverse lookup; no handle. */
+/** A reverse lookup, without a handle. */
 final class GetNameInfo extends Operation
 {
     public function getAddress(): string {}
     public function completeWithName(string $host, ?string $service = null): \Io\Completion {}
 }
 
-/** A wait on several Poll and Timer operations at once; no handle. */
+/** A wait on several Poll and Timer operations at once, without a handle. */
 final class Any extends Operation
 {
     /** @return list<Operation> */
@@ -467,8 +508,9 @@ final class Any extends Operation
 
 ''completeWithAddresses()'' and ''completeWithName()'' are the one place a userland provider fills a result
 itself. They exist so that a resolver written in PHP can answer the core's lookups behind
-''stream_socket_client()'', which a readiness based provider otherwise cannot do. The abstract ''Io\Operation''
-and the ''Io\Operation\'' namespace sharing a name follows ''Random\Engine'' and ''Random\Engine\Mt19937''.
+''stream_socket_client()'', which a readiness based provider otherwise cannot do. The abstract
+''Io\Operation'' and the ''Io\Operation\'' namespace sharing a name follows ''Random\Engine'' and
+''Random\Engine\Mt19937''.
 
 ==== Registrations ====
 
@@ -496,7 +538,7 @@ namespace Io;
  * A registered (handle, event) pair: waits on it repeat until it is removed.
  * The same object is passed to Hooks::add(), Hooks::remove() and returned by
  * Operation::getRegistration() for every wait on the pair. Valid from add()
- * until remove() returned or the provider was replaced; then isValid() is
+ * until remove() returned or the provider was replaced. After that isValid() is
  * false and the getters throw InvalidRegistrationException.
  */
 final class Registration
@@ -526,7 +568,7 @@ namespace Io;
 /**
  * An executor of operations: what a provider submits operations to and
  * blocks in. A queue performs or observes operations and reports their
- * completions; it never suspends anything, which is the provider's job.
+ * completions. It never suspends anything, which is the provider's job.
  * Two implementations ship: Io\Poll\OperationQueue, a readiness executor on
  * the Poll API, and Io\Ring\Engine from the Ring RFC, a completion executor.
  * A provider written against this interface works with either.
@@ -536,16 +578,16 @@ interface OperationQueue
     /**
      * Submit an operation. Returns the completion when the queue could
      * complete the operation at submit, in which case waitCompletions()
-     * never delivers it; null while the operation is in flight. $data is
-     * opaque and comes back in the completion's getData(); a provider puts
+     * never delivers it, or null while the operation is in flight. $data is
+     * opaque and comes back in the completion's getData(), so a provider puts
      * the waiting Fiber there.
      */
     public function submit(Operation $op, mixed $data = null): ?Completion;
 
-    /** Withdraw a submitted operation; no completion is delivered for it afterwards. */
+    /** Withdraw a submitted operation. No completion is delivered for it afterwards. */
     public function cancel(Operation $op): void;
 
-    /** Keep the pair set up until remove(); a trigger the queue cannot keep is served one-shot. */
+    /** Keep the pair set up until remove(). A trigger the queue cannot keep is served one-shot. */
     public function add(Registration $registration): void;
 
     public function remove(Registration $registration): void;
@@ -609,7 +651,7 @@ interface Hooks
 
     /**
      * Execute one operation and return its completion, or throw to cancel
-     * it. Called on the Fiber that runs the blocking PHP function; a provider
+     * it. Called on the Fiber that runs the blocking PHP function. A provider
      * on a queue submits the operation and suspends until its loop reaps the
      * completion.
      */
@@ -645,15 +687,39 @@ enum Capability
  */
 function set_hooks(?Hooks $hooks): ?Hooks {}
 
-/** The installed userland provider; null when none is installed or a C provider owns the request. */
+/** The installed userland provider, or null when none is installed or a C provider owns the request. */
 function get_hooks(): ?Hooks {}
 
 /** True when any provider is installed, C or userland. */
 function is_active(): bool {}
 </code>
 
-''getCapabilities()'', ''add()'' and ''remove()'' must not suspend and are called with Fiber switching blocked, so a
-''Fiber::suspend()'' inside them throws a ''FiberError''. ''run()'' is where a provider suspends.
+''getCapabilities()'', ''add()'' and ''remove()'' must not suspend and are called with Fiber switching
+blocked, so a ''Fiber::suspend()'' inside them throws a ''FiberError''. ''run()'' is where a provider
+suspends.
+
+==== Weak handle exposure ====
+
+<code php>
+<?php
+
+namespace Io\Poll;
+
+final class StreamPollWeakHandle implements WeakHandle
+{
+    /* as in the Polling API additions RFC */
+
+    /**
+     * The stream, or null: closed, not exposed, or frozen by an operation
+     * in flight.
+     * @return resource|null
+     */
+    public function getStream(): mixed {}
+
+    /** Whether getStream() may hand the stream out. */
+    public function isExposed(): bool {}
+}
+</code>
 
 ==== Curl socket handle ====
 
@@ -662,7 +728,7 @@ function is_active(): bool {}
 
 /**
  * Identity of one socket in a curl multi handle's connection pool, from the
- * first report to its removal. Created by the extension only; userland sees
+ * first report to its removal. Created by the extension only, and userland sees
  * it through operations and registrations. Lives in the global namespace
  * next to CurlHandle.
  */
@@ -710,14 +776,33 @@ final class Scheduler implements \Io\Hooks\Hooks
 
     public function run(\Io\Operation $op): \Io\Completion
     {
-        // On the Fiber inside fread(), curl_exec(), sleep(), ...: submit and hand
-        // the CPU to loop(), which resumes this Fiber with the completion.
-        $c = $this->queue->submit($op, \Fiber::getCurrent());
+        // Called inside fread(), curl_exec(), sleep(), ... on whatever runs them
+        $fiber = \Fiber::getCurrent();
+        $c = $this->queue->submit($op, $fiber);
         if ($c !== null) {
             return $c;               // completed at submit, no need to suspend
         }
         $this->inFlight++;
-        return \Fiber::suspend();
+        if ($fiber !== null) {
+            // Hand the CPU to loop(), which resumes this Fiber with the completion
+            return \Fiber::suspend();
+        }
+        // On the main flow there is nothing to suspend: run the loop here until
+        // this operation completes, with the other Fibers progressing meanwhile
+        while (true) {
+            $this->runReady();
+            foreach ($this->queue->waitCompletions() as $c) {
+                $this->inFlight--;
+                if ($c->getOperation() === $op) {
+                    $done = $c;
+                } else {
+                    $this->ready[] = [$c->getData(), $c];
+                }
+            }
+            if (isset($done)) {
+                return $done;
+            }
+        }
     }
 
     public function add(\Io\Registration $registration): void
@@ -730,14 +815,19 @@ final class Scheduler implements \Io\Hooks\Hooks
         $this->queue->remove($registration);
     }
 
-    /** The event loop, called by the script on the main Fiber. */
+    private function runReady(): void
+    {
+        while ($this->ready) {
+            [$fiber, $value] = array_shift($this->ready);
+            $fiber->isStarted() ? $fiber->resume($value) : $fiber->start();
+        }
+    }
+
+    /** The event loop, called by the script on the main flow. */
     public function loop(): void
     {
         while ($this->ready || $this->inFlight > 0) {
-            while ($this->ready) {
-                [$fiber, $value] = array_shift($this->ready);
-                $fiber->isStarted() ? $fiber->resume($value) : $fiber->start();
-            }
+            $this->runReady();
             if ($this->inFlight === 0) {
                 break;               // nothing waits: every task is done
             }
@@ -756,15 +846,20 @@ final class Scheduler implements \Io\Hooks\Hooks
 $scheduler = new Scheduler(new \Io\Poll\OperationQueue());
 \Io\Hooks\set_hooks($scheduler);
 
-$scheduler->spawn(fn () => print(file_get_contents('http://example.org/')));
-$scheduler->spawn(fn () => print(file_get_contents('http://example.com/')));
+$sizes = [];
+foreach (['http://example.org/', 'http://example.com/'] as $url) {
+    $scheduler->spawn(function () use ($url, &$sizes) {
+        $sizes[$url] = strlen(file_get_contents($url));
+    });
+}
 
 $scheduler->loop();   // both transfers proceed at once
+print_r($sizes);
 </code>
 
 ''loop()'' starts the first Fiber, which enters ''file_get_contents()''. The connect would block, so the core
-hands a ''Connect'' operation to ''run()'', which submits it and suspends the Fiber. ''loop()'' starts the second
-Fiber, which suspends the same way, then blocks in ''waitCompletions()''. When the first socket becomes
+hands a ''Connect'' operation to ''run()'', which submits it and suspends the Fiber. ''loop()'' starts the
+second Fiber, which suspends the same way, then blocks in ''waitCompletions()''. When the first socket becomes
 writable the queue reports the completion, ''loop()'' resumes that Fiber with it, ''run()'' returns it to the
 core, the core finishes the connect and the Fiber runs on until its next blocking point. The constructor
 argument is the whole difference between a readiness and a completion based scheduler. With the Ring's queue
@@ -836,41 +931,43 @@ operation's handle as a one-shot watcher, plus a ''TimerHandle'' for its deadlin
 The stream buffer, filters, chunk size and EOF handling do not change. The operation replaces the syscall,
 nothing above it. What follows lists what becomes an operation.
 
-**Socket streams** (''tcp://'', ''unix://'', ''udp://'' and the TLS transports): reads, writes, accepts and the
-connect in ''stream_socket_client()'' are operations, the liveness check is a Poll operation, and datagram sends
-and receives wait with a Poll operation when they would block. Socket descriptors are non-blocking while a
-stream holds them, with blocking mode emulated through the operation's deadline, and the mode is given back
+**Socket streams** (''tcp://'', ''unix://'', ''udp://'' and the TLS transports): reads, writes, accepts and
+the connect in ''stream_socket_client()'' are operations, the liveness check is a Poll operation, and datagram
+sends and receives wait with a Poll operation when they would block. Socket descriptors are non-blocking while
+a stream holds them, with blocking mode emulated through the operation's deadline, and the mode is given back
 when the stream lets go of the descriptor. TLS streams get a custom OpenSSL BIO whose read and write are the
 operations, so that TLS traffic can be offloaded by a completion provider too.
 
 **Plain files and pipes**: reads, writes and ''fflush()'' with sync are operations. Under a readiness provider
 regular files stay synchronous and pipes wait for readiness. With the ''Files'' capability both are offloaded.
 
-**Sleeping**: ''sleep()'', ''usleep()'', ''time_nanosleep()'' and ''time_sleep_until()'' are one Timer operation
-each. Without a provider they keep their ''nanosleep()'' resolution. With a provider the sleep ends when the
-provider's loop resumes the Fiber, so its precision is the provider's. The Poll queue waits with nanosecond
-deadlines on epoll, kqueue and event ports, but in whole milliseconds on the ''poll()'' and WSAPoll backends,
-and a loop under load adds the time of a pass. A ''usleep()'' or ''time_nanosleep()'' below a millisecond is
-therefore not sub-millisecond under every provider.
+**Sleeping**: ''sleep()'', ''usleep()'', ''time_nanosleep()'' and ''time_sleep_until()'' are one Timer
+operation each. Without a provider they keep their ''nanosleep()'' resolution. With a provider the sleep ends
+when the provider's loop resumes the Fiber, so its precision is the provider's. The Poll queue waits with
+nanosecond deadlines on epoll, kqueue and event ports, but in whole milliseconds on the ''poll()'' and WSAPoll
+backends, and a loop under load adds the time of a pass. A ''usleep()'' or ''time_nanosleep()'' below a
+millisecond is therefore not sub-millisecond under every provider.
 
-**Name lookups**: every lookup behind ''stream_socket_client()'', ''fsockopen()'', the http and ftp wrappers and
-''gethostbyname()'' is a ''GetAddrInfo'' operation and ''gethostbyaddr()'' a ''GetNameInfo''. Resolver semantics do
-not change unless a provider answers the lookup itself.
+**Name lookups**: every lookup behind ''stream_socket_client()'', ''fsockopen()'', the http and ftp wrappers
+and ''gethostbyname()'' is a ''GetAddrInfo'' operation and ''gethostbyaddr()'' a ''GetNameInfo''. Resolver
+semantics do not change unless a provider answers the lookup itself.
 
-**''stream_select()'' and ''socket_select()''** under a provider first check their sets without blocking, which
-answers a select with something ready now without any operation, and only a select that really waits builds
-an Any over its sets plus the timeout.
+**''stream_select()'' and ''socket_select()''** under a provider first check their sets without blocking,
+which answers a select with something ready now without any operation, and only a select that really waits
+builds an Any over its sets plus the timeout.
 
-**curl**: under a provider ''curl_exec()'' runs on libcurl's multi socket interface, waiting with an Any over the
-transfer's sockets and curl's timer between calls into libcurl. Without a provider it calls
-''curl_easy_perform()'' exactly as today. ''curl_multi_select()'' is the same Any, so a userland loop on the multi
-interface cooperates with a provider.
+**curl**: under a provider ''curl_exec()'' runs on libcurl's multi socket interface, waiting with an Any over
+the transfer's sockets and curl's timer between calls into libcurl. Without a provider it calls
+''curl_easy_perform()'' exactly as today. ''curl_multi_select()'' is the same Any, so a userland loop on the
+multi interface cooperates with a provider.
 
 **ext/sockets**: the blocking socket functions are operations with the same behaviour as socket streams, and
 ''socket_select()'' is the same Any as ''stream_select()''.
 
-**Processes and signals**: ''pcntl_wait()'', ''pcntl_waitpid()'', ''proc_close()'' and ''pclose()'' are ''WaitPid''
-operations, so several Fibers can wait for several children at once. ''pcntl_sigwaitinfo()'' and
+**Processes and signals**: ''pcntl_wait()'', ''pcntl_waitpid()'', ''proc_close()'' and ''pclose()'' are
+''WaitPid'' operations, so several Fibers can wait for several children at once. ''exec()'', ''system()'',
+''passthru()'' and ''shell_exec()'' run their command through the stream layer's ''popen()'' rather than the C
+library's, so their reads are pipe operations and their wait is a ''WaitPid''. ''pcntl_sigwaitinfo()'' and
 ''pcntl_sigtimedwait()'' are ''SigWait'' operations.
 
 Everything else built on streams, such as mysqlnd and the http and ftp wrappers, gets the behaviour for free.
@@ -879,28 +976,30 @@ Extensions that own their own descriptors, pgsql for example, are not covered an
 ===== Backward Incompatible Changes =====
 
 With no provider installed, existing scripts observe one change. Socket descriptors are non-blocking while a
-stream holds them. Code that takes the descriptor out of a stream, with ''socket_import_stream()'' or through a
-third-party extension, or a child process that inherits it, sees a non-blocking descriptor where it had a
-blocking one, until the stream lets go of it. The handle classes of the Poll API are the supported way to
-poll a stream from outside.
+stream holds them. Code that takes the descriptor out of a stream, with ''socket_import_stream()'' or through
+a third-party extension, or a child process that inherits it, sees a non-blocking descriptor where it had a
+blocking one, until the stream lets go of it. The handle classes of the Poll API are the supported way to poll
+a stream from outside. A child started with ''proc_open()'' and given a socket stream as its standard input is
+the common case of this, and it gets ''EAGAIN'' where it blocked before. Giving such a child a pipe is the
+documented advice.
 
 With a provider installed, the blocking functions listed under changes in php-src become suspension points.
-Code that was never written
-for interleaving then runs interleaved. A global modified by one Fiber while another Fiber is suspended in a
-database query is observed in the changed state when the query returns, which for code relying on global
-state, a WordPress plugin for example, is a change in behaviour. This is not entirely new, since stream
-notification callbacks and Fibers already let other code run in the middle of a stream operation, but the
-hooks extend it to the stream, socket, curl, sleep and process waits. It is the application's decision, made
-by installing a provider, and
-the provider's policy what runs meanwhile. Nothing changes for an application that installs none.
+Code that was never written for interleaving then runs interleaved. A global modified by one Fiber while
+another Fiber is suspended in a database query is observed in the changed state when the query returns, which
+for code relying on global state, a WordPress plugin for example, is a change in behaviour. This is not
+entirely new, since stream notification callbacks and Fibers already let other code run in the middle of a
+stream operation, but the hooks extend it to the stream, socket, curl, sleep and process waits. It is the
+application's decision, made by installing a provider, and the provider's policy what runs meanwhile. Nothing
+changes for an application that installs none.
 
-Also with a provider installed, concurrent use of one stream, curl handle or ''Socket'' from two Fibers throws
-an ''Error'' where the outcome was undefined before, and ''pcntl_fork()'' throws while an operation is in
-flight, since a provider's queue is not usable in the child.
+Also with a provider installed, concurrent use of one stream, curl handle, ''Socket'' or ''HashContext'' from
+two Fibers throws an ''Error'' where the outcome was undefined before, and ''pcntl_fork()'' throws while an
+operation is in flight, since a provider's queue is not usable in the child.
 
-For extensions, ''php_netstream_data_t'' grows, and the stream layer's connect and accept helpers gain variants
-that take the stream. The existing functions keep their signatures. The new classes and functions occupy
-names under ''Io\'', which the Poll API RFC introduced, and ''CurlSocketPollWeakHandle'' in the global namespace.
+Also with a provider installed, a pipe the script reads or writes, standard input and output included, is
+switched to non-blocking mode on the open file description for the duration, and that description is shared
+with every process holding it. A child started meanwhile that inherits it sees a non-blocking pipe, and a
+process killed without running its shutdown leaves the pipe in that mode.
 
 ===== Proposed PHP Version(s) =====
 
@@ -910,8 +1009,8 @@ Next minor version, PHP 8.7. Requires the Polling API additions RFC.
 
 ==== To SAPIs ====
 
-Hooks are per request and cleared at request shutdown, and a SAPI never installs one. Request shutdown work such
-as session writes runs after the provider is gone, synchronously.
+Hooks are per request and cleared at request shutdown, and a SAPI never installs one. Request shutdown work
+such as session writes runs after the provider is gone, synchronously.
 
 ==== To Existing Extensions ====
 
@@ -934,7 +1033,7 @@ None. Hooks are installed by code, per request.
 ===== Open Issues =====
 
   * **The ''Interrupted'' status.** Only the synchronous path produces it, and a provider on a queue never sees it. Whether to keep it in the userland enum or document ''Cancelled'' as the only early end a provider initiates.
-  * **Synchronous file reads under a readiness provider** block the whole process, as today. A provider may prefer an error to a silent block. A flag on ''set_hooks()'' could opt into that.
+  * **Consumers above the stream layer.** DOM, SimpleXML and XSL saving to a stream, and the unbuffered and persistent connection paths of mysqli and pdo_mysql, do not have the guard the section on suspension safety describes yet. They get one before the vote, and whether an opt-in per call site would be the safer default stays open.
 
 ===== Unaffected PHP Functionality =====
 
@@ -943,7 +1042,7 @@ wrappers, ''Io\Poll\Context::wait()'' and everything that does not block are not
 
 ===== Future Scope =====
 
-  * The Ring, a completion executor on io_uring, IOCP and a thread pool, is the companion RFC.
+  * The [[rfc:io_ring|Ring]], a completion executor on io_uring, IOCP and a thread pool, is the companion RFC.
   * A shared curl multi handle per request, so that pooled connections are shared across ''curl_exec()'' calls on different easy handles.
   * Operations for extensions that own their own descriptors, pgsql among them, and further operation types (datagram sends and receives, ''flock()'') if a consumer appears.
   * An opt-in to route ''Io\Poll\Context::wait()'' through the hooks, so that an application can wait on its own context inside a Fiber under a provider.
@@ -962,12 +1061,14 @@ The vote started on 2026-XX-XX at XX:XX UTC and ends on 2026-XX-XX at XX:XX UTC.
 
 ===== Patches and Tests =====
 
-A working implementation is on the ''io_hooks_poc'' branch at https://github.com/bukka/php-src/tree/io_hooks_poc.
-The tests in ''ext/standard/tests/streams/hooks'' run every scenario on both executors, with ''scheduler.inc''
-being the provider shown above. Further tests live in ''ext/curl/tests'', ''ext/openssl/tests'' and
-''ext/sockets/tests''. The demonstration for this RFC is a Revolt driver implementing ''Io\Hooks\Hooks'' on top
-of ''Io\Poll\OperationQueue'', so that existing AMPHP and ReactPHP code runs unmodified ''fread()'', ''sleep()''
-and ''curl_exec()'' calls concurrently.
+A working implementation is in the pull request at https://github.com/php/php-src/pull/23997. The tests are in
+''ext/standard/tests/streams/hooks'', ''ext/curl/tests'', ''ext/openssl/tests'' and ''ext/sockets/tests''. The
+branch also contains the Ring, so the API was designed and tested against a readiness and a completion
+executor at once and is known to accommodate the Ring. The provider the tests use is the scheduler shown
+above, in ''scheduler.inc'', and ''context-provider.inc'' is a provider on a bare ''Io\Poll\Context'' without
+a queue. The tests in ext/standard cover the operations, registrations, cancellation, frozen streams,
+processes, signals, sleeping and request shutdown, and the extension tests cover ''curl_exec()'' and
+''curl_multi_select()'', TLS streams and ext/sockets.
 
 ===== Implementation =====
 
@@ -979,10 +1080,12 @@ After the project is implemented, this section will contain:
 
   * [[rfc:poll_api|PHP RFC: Polling API]]
   * [[rfc:poll_api_additions|PHP RFC: Polling API additions]]
+  * Design document covering the Polling API additions, this RFC and the Ring: https://gist.github.com/bukka/87359261a4bfaa572ce43c93c0554b55
   * Async core RFC: https://github.com/true-async/php-async-core-rfc
-  * Revolt event loop: https://revolt.run/
   * Go's network poller: https://go.dev/src/runtime/netpoll.go
 
 ===== Changelog =====
 
+  * 1.1 - Suspension safety and operations outside a Fiber, weak handle exposure, exec family, BC notes from review
+  * 1.0 - Linked the Ring RFC, clarified stubs, examples and tests
   * 0.1 - Initial draft

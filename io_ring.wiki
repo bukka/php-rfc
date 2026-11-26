@@ -1,5 +1,5 @@
 ====== PHP RFC: Ring API ======
-  * Version: 0.1
+  * Version: 0.3
   * Date: 2026-09-29
   * Author: Jakub Zelenka, bukka@php.net
   * Status: Draft
@@ -9,12 +9,12 @@
 ===== Introduction =====
 
 The [[rfc:io_hooks|IO hooks and operations RFC]] lets a provider, typically an event loop or a Fiber
-scheduler, execute the blocking operations of PHP's stream layer, so that a Fiber suspends inside
-''fread()'' or ''curl_exec()'' instead of blocking the process. It ships one executor for those operations,
+scheduler, execute the blocking operations of PHP's stream layer, so that a Fiber suspends inside ''fread()''
+or ''curl_exec()'' instead of blocking the process. It ships one executor for those operations,
 ''Io\Poll\OperationQueue'', built on the Poll API. That executor can tell when a socket or a pipe is ready and
-let the engine perform the read, but it can do nothing about operations that have no notion of readiness, such as a
-read of a regular file, an ''fsync()'' or a host name lookup. Under such a provider those still block the whole
-process, exactly as today.
+let the engine perform the read, but it can do nothing about operations that have no notion of readiness, such
+as a read of a regular file, an ''fsync()'' or a host name lookup. Under such a provider those still block the
+whole process, exactly as today.
 
 This RFC adds the second executor, the **Ring**: an operation queue that performs operations itself, on the
 platform's native asynchronous IO where there is one and on a thread pool where there is none. Under a
@@ -26,24 +26,23 @@ provider on the Ring, ''file_get_contents()'' on a slow disk, a lookup against a
 There are two ways an operating system can help a program do many IO operations at once. A **readiness**
 interface (''select'', ''poll'', epoll, kqueue) answers the question "which of these descriptors can I operate
 on right now without blocking?", and the program then performs the operation itself. A **completion**
-interface (io_uring on Linux, IO completion ports on Windows) takes the whole operation, "read 8 KiB from
-this descriptor into this buffer", performs it in the background, and reports when it is done.
+interface (io_uring on Linux, IO completion ports on Windows) takes the whole operation, "read 8 KiB from this
+descriptor into this buffer", performs it in the background, and reports when it is done.
 
-The completion model covers everything the readiness model does, and also what it cannot. Regular files
-are always "ready" and always block, and so are library calls that are not descriptor operations at all, such
-as a name lookup. It also batches, so that under load many operations become a single system call. io_uring is the
+The completion model covers everything the readiness model does, and also what it cannot. Regular files are
+always "ready" and always block, and so are library calls that are not descriptor operations at all, such as a
+name lookup. It also batches, so that under load many operations become a single system call. io_uring is the
 Linux form of this model and has been the direction of Linux IO since kernel 5.1. This RFC is designed around
 it, and the other backends are its portable form.
 
 ==== The library ====
 
 The Ring is implemented on top of [[https://github.com/libior/ior|ior]], a C library with an API shaped like
-liburing and three backends: io_uring on Linux, IO completion ports on Windows, and a thread pool on the
-other POSIX platforms, which is also the fallback on Linux where io_uring exists but cannot be used (a
-kernel older than 5.19, ''io_uring_disabled'', a seccomp profile such as Docker's default, a memory lock
-limit). ior is bundled
-with PHP the way pcre2 and other libraries are, so the Ring is available on every platform PHP builds on and
-needs no external dependency.
+liburing and three backends: io_uring on Linux, IO completion ports on Windows, and a thread pool on the other
+POSIX platforms, which is also the fallback on Linux where io_uring exists but cannot be used (a kernel older
+than 5.19, ''io_uring_disabled'', a seccomp profile such as Docker's default, a memory lock limit). ior is
+bundled with PHP the way pcre2 and other libraries are, so the Ring is available on every platform PHP builds
+on and needs no external dependency.
 
 libuv, the usual answer to portable asynchronous IO, is deliberately not used. It is a full event loop with
 its own callback style and its own threads, it is readiness first with a thread pool bolted on for files, and
@@ -52,11 +51,11 @@ would, and the completion model here is io_uring's.
 
 ===== Terminology =====
 
-The terms of the hooks RFC (provider, operation, completion, operation queue, capability, registration)
-apply here unchanged. The Ring adds a few of its own.
+The terms of the hooks RFC (provider, operation, completion, operation queue, capability, registration) apply
+here unchanged. The Ring adds a few of its own.
 
-**Backend.** The mechanism the Ring runs on, which is io_uring, IO completion ports (IOCP) or the thread pool. ior
-picks one when the Ring is created and the choice is reported, not requested.
+**Backend.** The mechanism the Ring runs on, which is io_uring, IO completion ports (IOCP) or the thread pool.
+ior picks one when the Ring is created and the choice is reported, not requested.
 
 **Submission and completion queue.** The two halves of a ring. Operations are placed in the submission queue
 and handed to the backend in a batch. The backend places their outcomes in the completion queue, from which
@@ -64,104 +63,126 @@ the provider reaps them. The **depth** is how many entries fit in one batch. It 
 operations may be in flight.
 
 **Offloading.** Performing an operation off the calling thread, in the kernel or on a worker thread, so the
-Fiber that asked for it can be suspended meanwhile. The Ring offloads everything it is handed. The Poll
-queue offloads nothing and only waits for readiness.
+Fiber that asked for it can be suspended meanwhile. The Ring offloads everything it is handed. The Poll queue
+offloads nothing and only waits for readiness.
 
-**Multishot.** A single submission that produces many completions. One multishot accept on a listening
-socket reports every incoming connection, one multishot poll on a descriptor reports every change of its
-readiness. The Ring uses them to serve repeated waits without a submission per wait.
+**Multishot.** A single submission that produces many completions. One multishot accept on a listening socket
+reports every incoming connection, one multishot poll on a descriptor reports every change of its readiness.
+The Ring uses them to serve repeated waits without a submission per wait.
 
 **Notification handle.** A Poll API handle owned by the Ring that becomes readable whenever a completion is
 posted, so that a program which waits on a Poll context can be woken by the Ring without waiting on the Ring
 itself.
 
-**Orphaned operation.** An operation whose caller went away, because its Fiber was destroyed while
-suspended, while the backend still holds its buffer. The Ring keeps it until the backend is done and drops
-the result.
+**Orphaned operation.** An operation whose caller went away, because its Fiber was destroyed while suspended,
+while the backend still holds its buffer. The Ring keeps it until the backend is done and drops the result.
 
 ===== Proposal =====
 
 ==== The Engine ====
 
-''Io\Ring\Engine'' is an ''Io\OperationQueue'', the interface the hooks RFC defines, with the same ''submit()'',
-''cancel()'', ''waitCompletions()'' and ''countPending()''. A provider written against the interface works on it
-unchanged. The minimal scheduler of the hooks RFC becomes a completion based scheduler by constructing it
-with ''new Io\Ring\Engine()'' instead of ''new Io\Poll\OperationQueue()''.
+''Io\Ring\Engine'' is an ''Io\OperationQueue'', the interface the hooks RFC defines, with the same
+''submit()'', ''cancel()'', ''waitCompletions()'' and ''countPending()''. A provider written against the
+interface works on it unchanged. The minimal scheduler of the hooks RFC becomes a completion based scheduler
+by constructing it with ''new Io\Ring\Engine()'' instead of ''new Io\Poll\OperationQueue()''.
 
 Where the Poll queue turns an operation into a watcher and completes it as ''Ready'' for the engine to
 perform, the Ring performs it and completes it as ''Done'':
 
 ^ Operation ^ On the Ring ^
-| ''Poll'', ''Timer'', ''Any'' | a poll or timeout submission. An Any is its members submitted together, and the Ring cancels the losers when one completes |
+| ''Poll'', ''Any'' | a poll submission. An Any is its members submitted together, and the Ring cancels the losers when one completes |
+| ''Timer'' | an entry in the Engine's own deadline heap, which bounds its wait. There is no submission per timer |
 | ''Read'', ''Write'' | performed by the backend: the kernel's worker pool for a regular file on io_uring, an overlapped read on IOCP, a pool thread on the thread backend |
 | ''Recv'', ''Send'', ''Accept'', ''Connect'' | performed by the backend, inline during the submit when the socket is ready on the native backends |
 | ''GetAddrInfo'', ''GetNameInfo'', ''Fsync'' | a job on ior's worker pool, which every backend has for such calls, the native ones included |
-| ''WaitPid'', ''SigWait'' | native on every backend |
+| ''WaitPid'', ''SigWait'' | native on every backend, described below |
 
 It is named ''Engine'' rather than ''OperationQueue'', as ''Random\Engine'' is. It implements the queue
 interface, but it also owns the ring, chooses the backend, executes the operations itself and exposes a
 notification handle, where ''Io\Poll\OperationQueue'' only turns operations into watchers.
 
+==== Processes and signals ====
+
+''WaitPid'' and ''SigWait'' are the two waits with no descriptor to poll, and the Ring performs them natively
+on every backend. io_uring has a wait operation for a process since Linux 6.7 and the Ring watches a pidfd on
+older kernels, IOCP waits on the process handle, and the thread backend watches the child from its poller
+without occupying a thread. Whichever backend, the Ring only observes the exit. It reports the pid and the
+status of a child that exited and leaves the child waitable, and the engine collects it with ''waitpid()''
+when the completion is delivered, which is what a ''ProcessHandle'' in the Poll API does too. So
+''proc_close()'' and ''pcntl_waitpid()'' behave as they always did, several Fibers can wait for several
+children at once, and a wait the Ring cannot watch natively, any child, a process group or a stopped child on
+the thread backend, is probed from a timer and sees the change a little late.
+
+A ''SigWait'' takes a signal from its set the way ''sigwaitinfo()'' does, so the set has to be blocked in the
+process, which ''pcntl_sigwaitinfo()'' already requires. On the thread backend a worker sits in ''sigwait()''
+for it, and the Ring's own worker threads block every signal so they never take one. When two waits compete
+for a signal one of them gets it and the other keeps waiting. On Windows the console events behind ''SIGINT''
+and ''SIGBREAK'' are all the platform has, and a wait for any other signal completes ''Unsupported''.
+
 ==== Backend selection ====
 
 The backend is not selectable from PHP. ior picks the best one for the platform and ''getBackend()'' reports
-which. The test suite can force a backend so that every backend the platform has is exercised, but that
-is a testing facility and not part of the API.
+which. The test suite can force a backend so that every backend the platform has is exercised, but that is a
+testing facility and not part of the API.
 
 ==== Capabilities ====
 
 The hooks RFC lets a provider report what it can do beyond waiting for readiness. A Ring can serve more than
-the Poll queue, and ''Engine'' reports it in two sets. ''getHookCapabilities()'' is what a provider on the Ring
-should report by default, which is ''EdgeRegistrations'' where the backend's multishot poll reports edges, which is
-io_uring and the thread pool but not IOCP, and ''DirectAccept''. ''getSupportedHookCapabilities()'' is what the
-backend can serve for a provider that opts in, which adds ''Files'' on every backend, and ''DirectData'' on
-the native backends, where a receive on a ready socket is performed inline during the submit.
+the Poll queue, and ''Engine'' reports it in two sets. ''getHookCapabilities()'' is what a provider on the
+Ring should report by default, which is ''EdgeRegistrations'' where the backend's multishot poll reports
+edges, which is io_uring and the thread pool but not IOCP, and ''DirectAccept''.
+''getSupportedHookCapabilities()'' is what the backend can serve for a provider that opts in, which adds
+''Files'' on every backend, and ''DirectData'' on the native backends, where a receive on a ready socket is
+performed inline during the submit.
 
-The default is deliberately not everything the Ring can do, because the measurements below show that the
-rest loses in the common case. ''DirectData'' hands every data operation to the provider before the engine
-tries the system call. On io_uring that is one system call either way, but for a provider written in PHP it
-adds a round trip through userland per operation, which loses whenever the data is already there. It fits a
-provider written in C. ''Files'' hands regular file reads and writes to the Ring. A cached read is a memory
-copy, and the Ring turns it into a submission, a completion and a Fiber switch, so it pays off only for
-storage known to be slow, such as network file systems, or an ''fsync()'' heavy workload.
+The default is deliberately not everything the Ring can do, because the measurements below show that the rest
+loses in the common case. ''DirectData'' hands every data operation to the provider before the engine tries
+the system call. On io_uring that is one system call either way, but for a provider written in PHP it adds a
+round trip through userland per operation, which loses whenever the data is already there. It fits a provider
+written in C. ''Files'' hands regular file reads and writes to the Ring. A cached read is a memory copy, and
+the Ring turns it into a submission, a completion and a Fiber switch, so it pays off only for storage known to
+be slow, such as network file systems, or an ''fsync()'' heavy workload.
 
 ''DirectAccept'' is in the default because the Ring serves it from a multishot accept on the listening socket.
 Accepted connections wait in a buffer, and an accept that finds one completes at submit, so the accepting
 Fiber takes a burst of connections without a pass of the scheduler per connection. A direct accept without
 that took one connection per pass and made the last connection of a burst wait for every pass before it,
-measured as a p99 of about a second at a thousand connections. With the multishot accept it is 23 ms, in
-line with the Poll queue.
+measured as a p99 of about a second at a thousand connections. With the multishot accept it is 23 ms, in line
+with the Poll queue. A ''stream_select()'' on such a listener reports it readable while the Ring holds
+buffered connections, since the kernel's backlog is empty then and a plain ''poll()'' would say nothing.
 
 ==== Embedding a Ring in a Poll based loop ====
 
 A loop that wants to stay on its own ''Io\Poll\Context'' and still take file operations off the thread does
-not have to move to the Ring. ''Engine::getHandle()'' returns the notification handle, an ''Io\Poll\NotifyHandle''
-that is raised for every posted completion, so the Ring can be added to the context with ''Event::Notify''
-like any other handle, on every platform. When it fires, the loop calls ''waitCompletions()'' with a zero
-timeout until it returns an empty array. The first call clears the handle, and what is left unreaped after
-that is not announced again. The handle is the Ring's to signal, so ''notify()'' throws on it.
+not have to move to the Ring. ''Engine::getHandle()'' returns the notification handle, an
+''Io\Poll\NotifyHandle'' that is raised for every posted completion, so the Ring can be added to the context
+with ''Event::Notify'' like any other handle, on every platform. When it fires, the loop calls
+''waitCompletions()'' with a zero timeout until it returns an empty array. The first call clears the handle,
+and what is left unreaped after that is not announced again. The handle is the Ring's to signal, so
+''notify()'' throws on it.
 
 ==== Cancellation and abandoned operations ====
 
-On the Poll queue giving up on an operation is immediate. The watcher is removed and the operation is over.
-On the Ring an operation may have handed a buffer to the kernel or a worker thread, and the buffer stays in
-use until the backend reports the operation finished, cancelled or not. The Ring hides this from the
-provider. After ''cancel()'' returns, the provider is never handed a completion for the operation, and the Ring
-consumes the backend's completion itself. A Fiber destroyed while suspended in an operation leaves the
-operation orphaned. The Ring keeps a reference on the stream so the buffer stays valid, cancels the request,
-and finishes it silently later. The stream stays frozen until then and bytes already received are dropped.
-A provider needs no ''finally'' for any of this, and a Ring destroyed with operations in flight cancels them
-all and waits for each before it exits.
+On the Poll queue giving up on an operation is immediate. The watcher is removed and the operation is over. On
+the Ring an operation may have handed a buffer to the kernel or a worker thread, and the buffer stays in use
+until the backend reports the operation finished, cancelled or not. The Ring hides this from the provider.
+After ''cancel()'' returns, the provider is never handed a completion for the operation, and the Ring consumes
+the backend's completion itself. A Fiber destroyed while suspended in an operation leaves the operation
+orphaned. The Ring keeps a reference on the stream so the buffer stays valid, cancels the request, and
+finishes it silently later. The stream stays frozen until then and bytes already received are dropped. An
+orphaned ''WaitPid'' has collected nothing, so the child is still there for the next wait, and a signal an
+orphaned ''SigWait'' took is put back for the next wait on it. A provider needs no ''finally'' for any of
+this, and a Ring destroyed with operations in flight cancels them all and waits for each before it exits.
 
-Every input the backend touches (addresses, host names, signal sets) is copied into the Ring's own record
-at submit, and outputs reach the operation only when its completion is delivered, so a cancelled or orphaned
+Every input the backend touches (addresses, host names, signal sets) is copied into the Ring's own record at
+submit, and outputs reach the operation only when its completion is delivered, so a cancelled or orphaned
 operation never writes into memory that is gone. Only the stream's own read buffer is handed to the backend
 directly, so that the buffered read path makes no copies.
 
 ==== Fork ====
 
-A Ring inherited by a forked child is refused, not reused. The io_uring instance belongs to the parent and
-the thread pool's workers do not exist in the child. Every ''Engine'' method throws ''RingException'' there, and
+A Ring inherited by a forked child is refused, not reused. The io_uring instance belongs to the parent and the
+thread pool's workers do not exist in the child. Every ''Engine'' method throws ''RingException'' there, and
 the child closes its copies of the Ring's descriptors right after ''pcntl_fork()'' without touching the
 parent's Ring. ''pcntl_fork()'' itself throws while any operation is in flight, as the hooks RFC specifies.
 
@@ -183,43 +204,43 @@ $server = stream_socket_server('tcp://0.0.0.0:8080', $errno, $errstr,
 
 ==== Windows ====
 
-IO completion ports can only complete operations on files opened for overlapped IO, a mode that cannot be
-set after the fact and that PHP's file functions never used. The plain file wrapper therefore gets an
-overlapped path of its own, used for files opened while a provider with the ''Files'' capability is
-installed. Everything else keeps the C runtime path and is read synchronously. Only sockets can be polled on
-IOCP, so a Poll operation on anything else completes as ''Unsupported'' and the engine falls back as the hooks
-RFC specifies, and the Ring does not offer ''EdgeRegistrations'' there, since IOCP's multishot poll reports
-persisting readiness rather than changes.
+IO completion ports can only complete operations on files opened for overlapped IO, a mode that cannot be set
+after the fact and that PHP's file functions never used. The plain file wrapper therefore gets an overlapped
+path of its own, used for files opened while a provider with the ''Files'' capability is installed. Everything
+else keeps the C runtime path and is read synchronously. Only sockets can be polled on IOCP, so a Poll
+operation on anything else completes as ''Unsupported'' and the engine falls back as the hooks RFC specifies,
+and the Ring does not offer ''EdgeRegistrations'' there, since IOCP's multishot poll reports persisting
+readiness rather than changes.
 
 ==== Poll or Ring ====
 
 The two queues are not a fallback and a goal. Each is the better executor for a class of workloads, and a
 provider picks by what it runs and where.
 
-The Poll queue is the better choice where io_uring is unavailable or unwanted, which includes containers
-under Docker's default seccomp profile and distributions that ship io_uring disabled. There ior falls back
-to the thread pool, and a handoff to a worker and back per socket operation is worse than epoll with the
-syscall-first attempt. It is also the better choice where the process should have no threads, which
-matters for CLI scripts and FPM workers. For socket-bound workloads it is on par, since readiness with the
-syscall-first attempt is one system call per operation, the same as io_uring's inline completion, and it
-needs none of the buffer lifetime machinery. An existing loop is easier to adapt to it, since Revolt, AMPHP
-and ReactPHP are readiness loops. And where maturity matters it is the conservative choice, since the Poll
-API sits on mechanisms that are decades old and the Ring is new code over a new library.
+The Poll queue is the better choice where io_uring is unavailable or unwanted, which includes containers under
+Docker's default seccomp profile and distributions that ship io_uring disabled. There ior falls back to the
+thread pool, and a handoff to a worker and back per socket operation is worse than epoll with the
+syscall-first attempt. It is also the better choice where the process should have no threads, which matters
+for CLI scripts and FPM workers. For socket-bound workloads it is on par, since readiness with the
+syscall-first attempt is one system call per operation, the same as io_uring's inline completion, and it needs
+none of the buffer lifetime machinery. An existing loop is easier to adapt to it, since Revolt, AMPHP and
+ReactPHP are readiness loops. And where maturity matters it is the conservative choice, since the Poll API
+sits on mechanisms that are decades old and the Ring is new code over a new library.
 
-The Ring is the better choice where regular files matter, since a file read has no readiness form and only
-a completion executor can take it off the calling thread. The same holds where blocking library calls
-matter, since name lookups and ''fsync()'' have a home only in a work pool. On Windows the Ring is the
-native model, since IOCP is what the platform offers and WSAPoll does not scale. And under load a ring turns
-many operations into one system call, where a readiness loop pays one per operation.
+The Ring is the better choice where regular files matter, since a file read has no readiness form and only a
+completion executor can take it off the calling thread. The same holds where blocking library calls matter,
+since name lookups and ''fsync()'' have a home only in a work pool. On Windows the Ring is the native model,
+since IOCP is what the platform offers and WSAPoll does not scale. And under load a ring turns many operations
+into one system call, where a readiness loop pays one per operation.
 
-The two combine. A Poll based loop on Unix embeds a Ring for file and DNS operations through its
-notification handle, and a Ring based loop serves every readiness consumer through poll operations.
+The two combine. A Poll based loop on Unix embeds a Ring for file and DNS operations through its notification
+handle, and a Ring based loop serves every readiness consumer through poll operations.
 
 ==== Measurements ====
 
 A benchmark project (release builds on Linux 6.8, a Fiber scheduler over each queue, CPU pinning, repeated
-runs with significance tests) compared the queues. Throughput is relative to the Poll queue. "syscall-first" is
-the Ring's default, "Direct" has ''DirectData'' and ''DirectAccept'' with one-shot accepts:
+runs with significance tests) compared the queues. Throughput is relative to the Poll queue. "syscall-first"
+is the Ring's default, "Direct" has ''DirectData'' and ''DirectAccept'' with one-shot accepts:
 
 ^ Scenario ^ Ring io_uring, Direct ^ Ring io_uring, syscall-first ^ Ring threads ^
 | Ping-pong over a socket pair | -14% | +8.5% | -91% |
@@ -233,12 +254,14 @@ the Ring's default, "Direct" has ''DirectData'' and ''DirectAccept'' with one-sh
 | ''stream_select()'' over 400 streams | +24% | -2% | -78% |
 | ''fsync()'' with concurrent writers | | +264% | |
 
-The defaults follow from these numbers. Syscall-first io_uring is on par with the Poll queue for sockets
-and ahead on pipes, ''fsync()'' and large selects. Direct operations lose whenever data is usually there, so
-they are opt-in. Cached file reads lose on the Ring, so ''Files'' is opt-in. The thread backend is far behind
-on sockets, which is what the Poll queue is for where io_uring is unavailable. The thread backend column
-predates a rework of that backend in ior. Measured again after it, syscall-first on threads is 50 to 85%
-behind the Poll queue on sockets.
+The defaults follow from these numbers. Syscall-first io_uring is on par with the Poll queue for sockets and
+ahead on pipes, ''fsync()'' and large selects. Direct operations lose whenever data is usually there, so they
+are opt-in. Cached file reads lose on the Ring, so ''Files'' is opt-in. The thread backend is far behind on
+sockets, which is what the Poll queue is for where io_uring is unavailable. The thread backend column predates
+a rework of that backend in ior. Measured again after it, syscall-first on threads is 50 to 85% behind the
+Poll queue on sockets. The sleeping row predates the Engine's deadline heap. With one kernel timeout per sleep
+every completion interrupted the process, and ten thousand timers due at once fired tens of milliseconds late.
+With the heap the Ring is within the Poll queue's margin on that scenario.
 
 ===== API =====
 
@@ -258,12 +281,12 @@ enum Backend
 /**
  * The Ring: an operation queue that executes every operation itself, on
  * io_uring, IO completion ports or ior's thread pool. Operations reach it
- * from a provider's run(); a provider on it is a completion based scheduler.
+ * from a provider's run(), and a provider on it is a completion based scheduler.
  */
 final class Engine implements \Io\OperationQueue
 {
     /**
-     * Submission queue depth; 0 is the default (256). It sizes the batches
+     * Submission queue depth, where 0 is the default of 256. It sizes the batches
      * handed to the backend and does not bound the operations in flight.
      */
     public function __construct(int $entries = 0) {}
@@ -316,7 +339,8 @@ class RingException extends \Io\IoException {}
 class FailedRingOperationException extends RingException {}
 </code>
 
-The classes are final, not serializable and have strict properties.
+The classes are final. None of them is serializable or accepts dynamic properties, and the stubs are marked
+accordingly.
 
 The operations the Ring executes are always created by the engine. A user-created read on a stream would
 bypass the stream's buffer and filters, and the only correct asynchronous read on a stream is one that fills
@@ -354,8 +378,8 @@ $scheduler->spawn(function () {
 $scheduler->loop();
 </code>
 
-With the Ring's default capabilities the file read and the ''fsync()'' still run synchronously, since ''Files''
-is opt-in. A provider that knows its storage is slow opts in:
+With the Ring's default capabilities the file read and the ''fsync()'' still run synchronously, since
+''Files'' is opt-in. A provider that knows its storage is slow opts in:
 
 <code php>
 <?php
@@ -376,10 +400,10 @@ final class FileOffloadingScheduler extends Scheduler
 
 ==== A Poll loop embedding a Ring ====
 
-A provider on its own Poll context that sends only the operations without a readiness form to a Ring and
-reaps the Ring when its notification handle fires. Socket operations stay on the context. The base class is
-a provider that answers every operation with one-shot watchers on its context, as the hooks RFC describes
-and its test suite contains. Only the parts that concern the Ring are shown.
+A provider on its own Poll context that sends only the operations without a readiness form to a Ring and reaps
+the Ring when its notification handle fires. Socket operations stay on the context. The base class is a
+provider that answers every operation with one-shot watchers on its context, as the hooks RFC describes and
+its test suite contains. Only the parts that concern the Ring are shown.
 
 <code php>
 <?php
@@ -438,9 +462,7 @@ foreach ($ring->getSupportedHookCapabilities() as $capability) {
 
 ===== Backward Incompatible Changes =====
 
-None. The RFC adds the ''Io\Ring'' namespace and the ''accept_multishot'' stream context option, which is read
-only under a provider with ''DirectAccept''. Bundling ior adds a library to the PHP build, as pcre2 and
-others are.
+None.
 
 ===== Proposed PHP Version(s) =====
 
@@ -501,10 +523,10 @@ The vote started on 2026-XX-XX at XX:XX UTC and ends on 2026-XX-XX at XX:XX UTC.
 
 ===== Patches and Tests =====
 
-A working implementation is on the ''io_hooks_poc'' branch at https://github.com/bukka/php-src/tree/io_hooks_poc.
-The hooks test suite in ''ext/standard/tests/streams/hooks'' runs every scenario on the Ring as well, on both
-Linux backends, and CI runs the hooks, poll, TLS and curl tests on the Ring on Linux, macOS and Windows.
-ior is at https://github.com/libior/ior.
+A working implementation is in the IO hooks pull request at https://github.com/php/php-src/pull/23997. The
+hooks test suite in ''ext/standard/tests/streams/hooks'' runs every scenario on the Ring as well, on both
+Linux backends, and CI runs the hooks, poll, TLS and curl tests on the Ring on Linux, macOS and Windows. ior
+is at https://github.com/libior/ior.
 
 ===== Implementation =====
 
@@ -516,6 +538,7 @@ After the project is implemented, this section will contain:
 
   * [[rfc:io_hooks|PHP RFC: IO hooks and operations]]
   * [[rfc:poll_api_additions|PHP RFC: Polling API additions]]
+  * Design document covering the Polling API additions, the IO hooks and this RFC: https://gist.github.com/bukka/87359261a4bfaa572ce43c93c0554b55
   * ior: https://github.com/libior/ior
   * io_uring: https://kernel.dk/io_uring.pdf
   * liburing: https://github.com/axboe/liburing
@@ -523,4 +546,6 @@ After the project is implemented, this section will contain:
 
 ===== Changelog =====
 
+  * 0.3 - Timers from the Engine's deadline heap, select on a multishot listener
+  * 0.2 - Processes and signals section, docblocks and wrapping
   * 0.1 - Initial draft

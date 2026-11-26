@@ -1,8 +1,8 @@
 ====== PHP RFC: Polling API Additions ======
-  * Version: 0.1
+  * Version: 1.1
   * Date: 2026-09-29
   * Author: Jakub Zelenka, bukka@php.net
-  * Status: Draft
+  * Status: Under Discussion
   * First Published at: https://wiki.php.net/rfc/poll_api_additions
 
 
@@ -37,12 +37,13 @@ API, and together they make the Poll API a complete base for integrating an even
 
 ===== Proposal =====
 
-The additions fall into four groups:
+The additions fall into five groups:
 
   * **Weak handles**: a ''WeakHandle'' interface and ''StreamPollWeakHandle'', a handle that does not keep its stream alive and is automatically retired from every context when the stream is closed, with ''Context::onWatcherRemoved()'' to be told about it.
   * **Socket handles**: ''SocketPollHandle'' and ''SocketPollWeakHandle'' in ext/sockets, so ''Socket'' objects can be polled.
   * **Generic handles**: ''TimerHandle'', ''SignalHandle'', ''ProcessHandle'' and ''NotifyHandle'' in ''Io\Poll'', with the matching ''Event'' cases.
   * **Priority events**: ''Event::Priority'' for ''POLLPRI''.
+  * **Interrupted waits**: ''Context::wait()'' returns early when a signal PHP has a handler for arrives, so that the handler runs.
 
 ==== Weak Handles ====
 
@@ -73,7 +74,7 @@ identity of a resource without wanting to extend that resource's lifetime.
 <?php
 
 /**
- * One per stream, created by create() or internally; the stream keeps it
+ * One per stream, created by create() or internally. The stream keeps it
  * while it is open. Lives in the global namespace next to StreamPollHandle.
  */
 final class StreamPollWeakHandle implements Io\Poll\WeakHandle
@@ -88,16 +89,10 @@ final class StreamPollWeakHandle implements Io\Poll\WeakHandle
     public static function create($stream): static {}
 
     /**
-     * The stream, or null: closed, not exposed, or currently in use by an
-     * internal operation during which the stream must not be touched.
+     * The stream, or null once it was closed.
      * @return resource|null
      */
     public function getStream(): mixed {}
-
-    /**
-     * Whether getStream() may hand the stream out.
-     */
-    public function isExposed(): bool {}
 
     /**
      * False once the stream was closed.
@@ -124,12 +119,9 @@ number reused by a later ''fopen()'' can never reach an old watcher. The same re
 ''StreamPollHandle'' when its stream is closed with ''fclose()''. The difference is only that the strong
 handle keeps the stream open for as long as the handle itself is referenced.
 
-**The stream is exposed or not.** ''getStream()'' returns the stream only when the handle is exposed, meaning
-created through ''create()'', or created internally for a stream the script already holds. Handles the engine
-creates for streams that were never visible to userland, such as the socket inside the http wrapper or a
-mysqlnd connection, report ''isExposed()'' false and ''getStream()'' null, since handing them out would create
-a resource for a stream that was never meant to be seen. ''getStream()'' also returns null while the stream is
-in use by an internal operation that must not be interrupted.
+**Handles for streams the script never saw** are created by the engine under the IO hooks RFC, for a socket
+inside the http wrapper for example. That RFC adds an exposure rule to ''getStream()'' for them. It is
+specified there, since nothing in this RFC can produce such a handle.
 
 === Why a static factory ===
 
@@ -232,7 +224,7 @@ namespace Io\Poll;
 
 /**
  * A deadline in the context, one-shot or periodic. Watched with
- * Event::Timer; a fired one-shot timer is re-armed by modifyEvents().
+ * Event::Timer. A fired one-shot timer is re-armed by modifyEvents().
  */
 final class TimerHandle implements Handle
 {
@@ -251,10 +243,11 @@ called so that a busy level-triggered descriptor cannot starve them. This is the
 Boost.Asio and the Go runtime. ''timerfd'', ''EVFILT_TIMER'' and ''PORT_SOURCE_TIMER'' are deliberately not
 used. They cost a descriptor or a source per timer and buy nothing over the heap on a single thread.
 
-A periodic timer re-arms from its previous deadline rather than from the time it was reported, so it does not
-drift, and one that fell behind catches up in a single step. A fired one-shot timer stays registered and
-disarmed, like a fired one-shot watcher, and ''modifyEvents()'' re-arms it. Backends that take milliseconds
-(''poll'', ''WSAPoll'') round the timeout up, so a deadline never fires early.
+The deadline is on the monotonic clock and counts from ''Context::add()''. A re-armed one-shot timer counts
+from its ''modifyEvents()'', and a periodic timer re-arms from its previous deadline rather than from the time
+it was reported, so it does not drift, and one that fell behind catches up in a single step. A fired one-shot
+timer stays registered and disarmed, like a fired one-shot watcher, and ''modifyEvents()'' re-arms it.
+Backends that take milliseconds (''poll'', ''WSAPoll'') round the timeout up, so a deadline never fires early.
 
 === SignalHandle ===
 
@@ -264,9 +257,9 @@ disarmed, like a fired one-shot watcher, and ''modifyEvents()'' re-arms it. Back
 namespace Io\Poll;
 
 /**
- * Signals as events. The signals are blocked in the process signal mask
- * for the life of the handle, so they queue instead of running a
- * handler; a delivery is consumed and recorded when the context reports
+ * Signals as events. While the handle is in a context its signals are
+ * blocked in the process signal mask, so they queue instead of running a
+ * handler. A delivery is consumed and recorded when the context reports
  * Event::Signal.
  */
 final class SignalHandle implements Handle
@@ -289,12 +282,18 @@ and ''EVFILT_SIGNAL'' on kqueue platforms, where the source consumes the signal 
 has no ''sigtimedwait()''. Event ports and WSAPoll have no such source, so ''Context::add()'' throws
 ''FailedHandleAddException'' there and ''Backend::supportsSignalHandles()'' says so in advance.
 
-The signals of a handle are blocked in the process signal mask for the life of the handle, counted per signal
-across handles, so that they queue instead of being delivered to a handler. This is designed together with
-pcntl. A handler installed with ''pcntl_signal()'' for the same signal never runs while a handle for it lives,
-and ''pcntl_sigwaitinfo()'' and ''pcntl_sigtimedwait()'' keep requiring the caller to block the set, as today.
-The blocked mask does not leak into executed programs. ''proc_open()'', ''popen()'', ''pcntl_exec()'' and
-''mail()'' give the child a mask without the handles' signals.
+The signals of a handle are blocked in the process signal mask while the handle is in a context, so that they
+queue for the source instead of being delivered to a handler. The first ''Context::add()'' of the handle
+blocks them and the last removal unblocks them, whether through ''Watcher::remove()'', through the context
+being destroyed with the handle still in it or through the handle being collected first. A context counts once
+per handle, and the signals are counted across handles. A handle that is in no context does nothing, like a
+stream handle, and a signal arriving then takes its normal disposition. This is designed together with pcntl.
+A handler installed with ''pcntl_signal()'' for the same signal never runs while a handle for it is watched.
+''pcntl_sigprocmask()'' leaves a watched signal blocked whatever it is asked, and ''pcntl_signal()'' blocks it
+again after installing the handler, since installing one unblocks the signal. ''pcntl_sigwaitinfo()'' and
+''pcntl_sigtimedwait()'' keep requiring the caller to block the set, as today. The blocked mask does not leak
+into programs PHP starts. ''proc_open()'', ''popen()'', ''exec()'', ''system()'', ''passthru()'',
+''shell_exec()'', ''pcntl_exec()'' and ''mail()'' give the child a mask without the handles' signals.
 
 The constructor refuses, with a ''ValueError'', signals that cannot be blocked (''SIGKILL'', ''SIGSTOP''),
 signals whose blocking is undefined when a fault raises them (''SIGSEGV'', ''SIGBUS'', ''SIGFPE'',
@@ -302,10 +301,18 @@ signals whose blocking is undefined when a fault raises them (''SIGSEGV'', ''SIG
 ''SIGALRM'' or ''SIGRTMIN'' depending on the platform and build), since a handle on it would silently disable
 the execution timeout.
 
-When the last handle for a signal is destroyed and the signal is still pending, it would be delivered with its
-current disposition, which for most signals without a handler ends the process. The destructor therefore
-discards pending signals that no handler takes before unblocking them. A signal with a handler stays pending
-and runs the handler once unblocked.
+Before the last removal unblocks a signal, the handle drains what the source still holds for it into its
+record, so a delivery that arrived while the handle was watched is never lost and ''getDelivered()'' still
+returns it afterwards. Only the signals the removal unblocks are drained. One the process had blocked itself
+before any handle stays pending for whoever waits for it. Nothing is discarded. A signal that arrives after
+the unblock is delivered as it would be without the handle.
+
+Blocking the signals has two consequences a script should know. While a signal is watched, a blocking call
+such as ''sleep()'' or a read on a socket runs to completion instead of being interrupted by it, since the
+signal is queued for the handle rather than delivered. And a watched signal only has an effect when the script
+observes it through ''wait()''. A script that watches ''SIGTERM'' and never waits exits normally after one,
+because the last removal drains the delivery into a handle that is then freed. Signals are events in this
+model, and a loop that wants ''SIGTERM'' to end it reacts to the event.
 
 In thread-safe builds the signal mask is per thread and the source only reads signals already pending in the
 process. A signal sent to the process is delivered to any thread that does not block it, so in a SAPI running
@@ -322,10 +329,10 @@ namespace Io\Poll;
 
 /**
  * A process by pid. Each context reports Event::Process once when the
- * process exited. A child is reaped through the handle and getStatus()
- * has its wait status; a later proc_close() or pcntl_waitpid() on it
- * reads that. The status stays null for a process that is not our child
- * or was reaped elsewhere.
+ * process exited. The handle reads the exit status without collecting
+ * the child, so getStatus() has its wait status and a later proc_close()
+ * or pcntl_waitpid() still collects it. The status stays null for a
+ * process that is not our child or was collected already.
  */
 final class ProcessHandle implements Handle
 {
@@ -336,7 +343,7 @@ final class ProcessHandle implements Handle
 
     public function getPid(): int {}
 
-    /** The wait status once the child was reaped through this handle, null before. */
+    /** The wait status once the process exited, null before. */
     public function getStatus(): ?int {}
 }
 </code>
@@ -348,16 +355,18 @@ kqueue platforms. Event ports and WSAPoll have no source, so ''Context::add()'' 
 ''SIGCHLD'' plus ''waitpid(WNOHANG)'' approach libuv and tokio use is deliberately not taken, since
 ''SIGCHLD'' is process-global and would collide with pcntl's handlers and any other ''waitpid()'' caller.
 
-Neither source reaps the child, so when the source fires the handle calls ''waitpid(WNOHANG)'' and records the
-status. By the time ''Event::Process'' is reported, ''getStatus()'' is set. The exit is state of the handle:
-every context watching it reports it once and then drops the descriptor from its backend. A handle on a
-process that is not a child is accepted on purpose, as an exit notification, and ''Event::Process'' is then
-reported with a null status.
+Neither source collects the child, and neither does the handle. When the source fires, the handle reads the
+exit status with ''waitid()'' and ''WNOWAIT'', which reports the status and leaves the child waitable, and
+records it. It asks by the pidfd where there is one, so a pid reused after the child was collected elsewhere
+is never asked for another process's status. By the time ''Event::Process'' is reported, ''getStatus()'' is
+set. The exit is state of the handle, so every context watching it reports it once and then drops the
+descriptor from its backend. A handle on a process that is not a child is accepted on purpose, as an exit
+notification, and ''Event::Process'' is then reported with a null status.
 
-A child reaped through a handle must still be waitable by the code that created it, so the status goes into a
-per-request registry keyed by pid, and ''proc_close()'', ''pclose()'', ''pcntl_waitpid()'' and
-''pcntl_wait()'' read it from there instead of failing with ''ECHILD''. An entry is dropped when a new child
-gets the same pid, and the registry is cleared in a forked child. ''fromProcess()'' takes a ''proc_open()''
+The handle only observes the exit. Collecting the child stays with the code that created it, exactly as today.
+''proc_close()'', ''pclose()'', ''pcntl_waitpid()'' and ''pcntl_wait()'' work unchanged and return at once for
+a child that already exited, and a child nobody waits for stays a zombie, as it does now. No state is kept
+outside the handle, so there is nothing to look up or expire. ''fromProcess()'' takes a ''proc_open()''
 resource, which is the form that works on Windows, where the process handle lives in the resource.
 ''Context::add()'' still refuses the handle there, WSAPoll having nothing to watch, but ''getStatus()''
 answers the exit code for whoever waited for the process.
@@ -399,6 +408,20 @@ what the self-pipe trick provides today, without the pipe.
 
 An extension may hand out a notify handle it owns and raises itself, as the identity of its own event source.
 On such a handle ''notify()'' throws an ''Error'', since only the owner raises it.
+
+==== Interrupted Waits ====
+
+''Context::wait()'' woken by a signal that PHP has a handler for returns an empty array, so that the handler
+runs before the loop waits again. On master the wait restarts on every ''EINTR'', so a handler installed with
+''pcntl_signal()'' runs only once something else ends the wait, which can be the full timeout. A wait woken by
+any other signal restarts with the remaining time, as today. No exception is thrown for either, and
+''FailedPollWaitException'' keeps meaning a failure. ''wait()'' also makes the check before it blocks, so a
+signal that arrived between the handler's last run and the call does not sit through the timeout.
+
+This is the one change to the behaviour of the accepted API in this RFC. An empty result now means timeout or
+signal, which the accepted RFC did not rule out, and a loop that treats an empty array as nothing to do keeps
+working.
+
 
 ==== Event Enum Additions ====
 
@@ -448,7 +471,7 @@ enum Backend
 {
     /* existing cases and methods */
 
-    /** Whether Event::Priority is reported; kqueue and WSAPoll cannot. */
+    /** Whether Event::Priority is reported. kqueue and WSAPoll cannot. */
     public function supportsPriority(): bool {}
 
     /** Whether a ProcessHandle can be added: a pidfd on Linux, EVFILT_PROC on kqueue. */
@@ -554,7 +577,7 @@ while ($procs) {
         $name = $watcher->getData();
         $status = $watcher->getHandle()->getStatus();
         echo "$name exited with ", pcntl_wexitstatus($status), "\n";
-        // proc_close() reads the status the handle recorded instead of waiting
+        // the child already exited, so proc_close() collects it without waiting
         proc_close($procs[$name]);
         unset($procs[$name]);
     }
@@ -575,7 +598,7 @@ $ctx->add($wakeup, [Event::Notify], 'wakeup');
 $queue = new SplQueue();
 
 // A pcntl handler runs between opcodes, so it cannot interrupt wait() by
-// itself; raising the handle makes the loop see the queued work at once
+// itself. Raising the handle makes the loop see the queued work at once
 pcntl_async_signals(true);
 pcntl_signal(SIGUSR1, function () use ($queue, $wakeup) {
     $queue->enqueue('reload configuration');
@@ -604,7 +627,7 @@ use Io\Poll\{Context, Event, Watcher};
 final class Server
 {
     private Context $ctx;
-    /** Handle object => per-connection state; the handle keeps nothing alive */
+    /** Handle object => per-connection state. The handle keeps nothing alive */
     private WeakMap $connections;
 
     public function __construct(private $listener)
@@ -614,7 +637,7 @@ final class Server
         $this->ctx->add(StreamPollWeakHandle::create($listener), [Event::Read]);
         // Told about every watcher the context dropped because a stream was closed
         $this->ctx->onWatcherRemoved(function (Watcher $w) {
-            echo "connection closed elsewhere\n";
+            echo "connection closed\n";
             unset($this->connections[$w->getHandle()]);
         });
     }
@@ -635,9 +658,8 @@ final class Server
                 $state = &$this->connections[$handle];
                 $data = fread($state['stream'], 8192);
                 if ($data === '' || $data === false) {
-                    // Closing the stream retires the watcher; onWatcherRemoved() is not
-                    // called for it since it is our own close, so clean up here
-                    unset($this->connections[$handle]);
+                    // Closing the stream retires the watcher, and the next wait() reports
+                    // it through onWatcherRemoved(), which drops the state
                     fclose($state['stream']);
                     continue;
                 }
@@ -686,9 +708,10 @@ notify handle and is async-signal-safe.
 
 ===== Backward Incompatible Changes =====
 
-This RFC only adds new functionality and does not change the behaviour of existing APIs. ''Io\Poll\Event''
-gains cases, so a ''match'' over its cases without a default arm would need updating, which is the usual
-consequence of extending an enum.
+Apart from the interrupted waits, this RFC only adds new functionality. ''Context::wait()'' returns an empty
+array for a signal with a PHP handler where it used to keep waiting, which a loop that treats an empty result
+as a timeout already handles. ''Io\Poll\Event'' gains cases, so a ''match'' over its cases without a default
+arm would need updating, which is the usual consequence of extending an enum.
 
 ===== Proposed PHP Version(s) =====
 
@@ -702,10 +725,10 @@ Next minor version, PHP 8.7.
 
 ==== To Existing Extensions ====
 
-ext/sockets gains the two handle classes and retires watchers in ''socket_close()''. ext/pcntl's wait
-functions and ''proc_close()'' consult the registry of children reaped through a handle. ext/standard's
-''proc_open()'', ''popen()'', ''mail()'' and ext/pcntl's ''pcntl_exec()'' keep the handles' signals out of the
-mask of the programs they start.
+ext/sockets gains the two handle classes and retires watchers in ''socket_close()''. ext/standard's
+''proc_open()'', ''popen()'', ''exec()'', ''system()'', ''passthru()'', ''shell_exec()'', ''mail()'' and
+ext/pcntl's ''pcntl_exec()'' keep the handles' signals out of the mask of the programs they start, and
+ext/pcntl's ''pcntl_sigprocmask()'' and ''pcntl_signal()'' keep a watched signal blocked.
 
 ==== To Opcache ====
 
@@ -721,7 +744,8 @@ None.
 
 ===== Open Issues =====
 
-  * **Signal handles in ZTS.** A process-wide handler writing to a self-pipe, the libuv model, would lift the CLI-only limit in thread-safe builds at the price of owning the handler together with pcntl. Whether to do that here or later.
+  * **Blocking the signals, or a self-pipe.** A process-wide handler writing to a self-pipe, the libuv model, blocks nothing, so the two consequences described under ''SignalHandle'' go away and the CLI-only limit in thread-safe builds with them, at the price of owning the handler together with pcntl. Whether to switch to it here or later.
+  * **A handle on a process that is not a child.** ''new ProcessHandle($pid)'' on a pid that is not a child races pid reuse, since nothing keeps the pid from being handed to a new process, and ''getStatus()'' differs across platforms, a wait status on POSIX and an exit code on Windows, non-null for a non-child only there. Either the constructor accepts children only and a non-child needs a form of its own that is plainly an exit notification, or the status gets one shape on both platforms.
 
 ===== Unaffected PHP Functionality =====
 
@@ -735,9 +759,41 @@ part of the accepted Poll API that this RFC does not name behave as before.
 
 ===== Proposed Voting Choices =====
 
-As per the voting RFC, a yes/no vote with a 2/3 majority is needed for this proposal to be accepted.
+The additions are voted by group, each a yes/no vote needing a 2/3 majority, so that one group does not hold
+back the others. A group that fails is left out and the rest stands on its own. The IO hooks RFC builds on
+every group but the priority events.
 
-<doodle title="Should the Polling API additions be added to PHP?" auth="bukka" voteType="single" closed="true">
+<doodle title="Add the weak handles and Context::onWatcherRemoved()?" auth="bukka" voteType="single" closed="true">
+   * Yes
+   * No
+   * Abstain
+</doodle>
+
+<doodle title="Add the socket handles?" auth="bukka" voteType="single" closed="true">
+   * Yes
+   * No
+   * Abstain
+</doodle>
+
+<doodle title="Add TimerHandle, NotifyHandle and Event::Priority?" auth="bukka" voteType="single" closed="true">
+   * Yes
+   * No
+   * Abstain
+</doodle>
+
+<doodle title="Add SignalHandle?" auth="bukka" voteType="single" closed="true">
+   * Yes
+   * No
+   * Abstain
+</doodle>
+
+<doodle title="Add ProcessHandle?" auth="bukka" voteType="single" closed="true">
+   * Yes
+   * No
+   * Abstain
+</doodle>
+
+<doodle title="Change Context::wait() to return early for a signal with a PHP handler?" auth="bukka" voteType="single" closed="true">
    * Yes
    * No
    * Abstain
@@ -747,9 +803,9 @@ The vote started on 2026-XX-XX at XX:XX UTC and ends on 2026-XX-XX at XX:XX UTC.
 
 ===== Patches and Tests =====
 
-A working implementation is part of the ''io_hooks_poc'' branch at
-https://github.com/bukka/php-src/tree/io_hooks_poc, in ''main/poll'' and ''ext/standard/io_poll*'', with tests
-in ''ext/standard/tests/poll'' and ''ext/sockets/tests''. It will be extracted into a pull request of its own.
+A working implementation is part of the IO hooks pull request at https://github.com/php/php-src/pull/23997, in
+''main/poll'' and ''ext/standard/io_poll*'', with tests in ''ext/standard/tests/poll'' and
+''ext/sockets/tests''. It will be extracted into a pull request of its own.
 
 ===== Implementation =====
 
@@ -760,6 +816,7 @@ After the project is implemented, this section will contain:
 ===== References =====
 
   * [[rfc:poll_api|PHP RFC: Polling API]]
+  * Design document covering this RFC, the IO hooks and the Ring: https://gist.github.com/bukka/87359261a4bfaa572ce43c93c0554b55
   * signalfd: https://man7.org/linux/man-pages/man2/signalfd.2.html
   * pidfd_open: https://man7.org/linux/man-pages/man2/pidfd_open.2.html
   * eventfd: https://man7.org/linux/man-pages/man2/eventfd.2.html
@@ -768,4 +825,6 @@ After the project is implemented, this section will contain:
 
 ===== Changelog =====
 
+  * 1.1 - Interrupted waits, votes by group, exposure moved to the hooks RFC, review notes on signal and process handles
+  * 1.0 - Signal handles block signals only while watched, process handles no longer collect the child
   * 0.1 - Initial draft
